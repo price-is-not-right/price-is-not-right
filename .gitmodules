@@ -1,6 +1,7 @@
 [submodule "openpi"]
-  path = openpi
-  url  = https://github.com/trd44/openpi.git
+	path = openpi
+	url = https://github.com/trd44/openpi.git
+	branch = ICRA2026
 [submodule "robosuite"]
 	path = robosuite
 	url = https://github.com/lorangpi/robosuite.git
