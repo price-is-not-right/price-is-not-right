@@ -1,0 +1,16 @@
+[submodule "openpi"]
+  path = openpi
+  url  = https://github.com/trd44/openpi.git
+[submodule "robosuite"]
+	path = robosuite
+	url = https://github.com/lorangpi/robosuite.git
+	branch = CyclicLxM
+[submodule "robosuite-task-zoo"]
+	path = robosuite-task-zoo
+	url = https://github.com/ARISE-Initiative/robosuite-task-zoo.git
+[submodule "tarski"]
+	path = tarski
+	url = https://github.com/helenlu66/tarski.git
+[submodule "rlds_dataset_builder"]
+	path = rlds_dataset_builder
+	url = https://github.com/trd44/rlds_dataset_builder.git
