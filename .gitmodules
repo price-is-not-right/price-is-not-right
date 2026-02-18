@@ -15,3 +15,9 @@
 [submodule "rlds_dataset_builder"]
 	path = rlds_dataset_builder
 	url = https://github.com/trd44/rlds_dataset_builder.git
+[submodule "neuro_symbolic_method/diffusion_policy"]
+	path = neuro_symbolic_method/diffusion_policy
+	url = https://github.com/real-stanford/diffusion_policy.git
+[submodule "neuro_symbolic_method/learner-strips"]
+	path = neuro_symbolic_method/learner-strips
+	url = https://github.com/bonetblai/learner-strips.git
