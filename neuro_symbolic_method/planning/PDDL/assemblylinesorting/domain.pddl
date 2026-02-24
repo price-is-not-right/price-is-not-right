@@ -1,0 +1,22 @@
+(define (domain assemblyline)
+  (:requirements :strips :typing)
+  (:types disk peg - location)
+
+  (:predicates
+    (on ?disk - disk ?location - location)  ; disk is on another disk or a peg
+    (clear ?location - location)       ; no disk is on disk
+    (grasped ?disk - disk)     ; robot is grasped a disk
+    (free-gripper) ; the gripper is free
+    (type_match ?disk - disk ?location - location)
+  )
+
+  (:action pick
+    :parameters (?d - disk ?l - location)
+    :precondition (and (clear ?d) (on ?d ?l) (free-gripper))
+    :effect (and (clear ?l) (not(on ?d ?l)) (grasped ?d) (not (free-gripper))))
+
+  (:action place
+    :parameters (?d - disk ?l - location)
+    :precondition (and (grasped ?d) (type_match ?d ?l) (clear ?l))
+    :effect (and (not (grasped ?d)) (on ?d ?l) (free-gripper)))
+)

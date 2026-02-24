@@ -1,0 +1,68 @@
+env_name: KitchenEnv
+detector: KitchenDetector
+planning_mode: 1
+planning_predicates: [on, clear, grasped, stove_on]
+
+pddl_path: planning/PDDL/kitchen.pddl
+yolo_model: models/yolo/kitchen_yolo.pt
+regressor_model: models/regressors/kitchen_regressor.pkl
+
+policies:
+  grasp: policies/kitchen/grasp.ckpt
+  drop: policies/kitchen/drop.ckpt
+  reach_pick: policies/kitchen/reach_pick.ckpt
+  reach_place: policies/kitchen/reach_drop.ckpt
+  turnon: policies/kitchen/turnon.ckpt
+  turnoff: policies/kitchen/turnoff.ckpt
+
+object_mapping:
+  bread: o1
+  pot: o2
+  stove: o3
+  serving: o4
+  table: o5
+
+executors:
+  - id: ReachPick
+    policy_key: reach_pick
+    termination_condition: reach_pick
+    nulified_action_indexes: [3]
+    oracle: true
+    horizon_formula: "8/n_act*55"
+
+  - id: Pick
+    policy_key: grasp
+    termination_condition: pick
+    nulified_action_indexes: [0, 1]
+    oracle: true
+    horizon_formula: "8/n_act*20"
+
+  - id: ReachDrop
+    policy_key: reach_place
+    termination_condition: reach_drop
+    nulified_action_indexes: [3]
+    oracle: true
+    horizon_formula: "8/n_act*55"
+
+  - id: Drop
+    policy_key: drop
+    termination_condition: drop
+    nulified_action_indexes: [0, 1]
+    oracle: true
+    horizon_formula: "8/n_act*20"
+
+  - id: TurnOn
+    policy_key: turnon
+    termination_condition: turnon
+    nulified_action_indexes: [3]
+    oracle: true
+    horizon_formula: "8/n_act*20"
+
+  - id: TurnOff
+    policy_key: turnoff
+    termination_condition: turnoff
+    nulified_action_indexes: [3]
+    oracle: true
+    horizon_formula: "8/n_act*20"
+
+goal_strategy: default

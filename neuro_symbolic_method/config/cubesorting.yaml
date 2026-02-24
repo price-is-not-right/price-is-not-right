@@ -1,0 +1,58 @@
+env_name: CubeSorting
+detector: CubeSortingDetector
+planning_mode: 0
+planning_predicates: [on, clear, grasped, type_match]
+
+pddl_path: planning/PDDL/cubesorting/
+yolo_model: models/yolo/hanoi_yolo.pt
+regressor_model: models/regressors/hanoi_regressor.pkl
+
+policies:
+  grasp: policies/noisy_30/grasp.ckpt
+  drop: policies/noisy_30/drop.ckpt
+  reach_pick: policies/noisy_30/reach_pick.ckpt
+  reach_place: policies/noisy_30/reach_drop.ckpt
+
+object_mapping:
+  cube1: o1
+  cube2: o2
+  cube3: o3
+  peg1: o4
+  peg2: o5
+  peg3: o6
+
+executors:
+  - id: ReachPick
+    policy_key: reach_pick
+    termination_condition: reach_pick
+    nulified_action_indexes: [3]
+    oracle: true
+    horizon_formula: "8/n_act*55"
+
+  - id: Pick
+    policy_key: grasp
+    termination_condition: pick
+    nulified_action_indexes: [0, 1]
+    oracle: true
+    horizon_formula: "8/n_act*20"
+
+  - id: ReachDrop
+    policy_key: reach_place
+    termination_condition: reach_drop
+    nulified_action_indexes: [3]
+    oracle: true
+    horizon_formula: "8/n_act*55"
+
+  - id: Drop
+    policy_key: drop
+    termination_condition: drop
+    nulified_action_indexes: [0, 1]
+    oracle: true
+    horizon_formula: "8/n_act*20"
+
+# Goal: small cubes -> platform1, non-small -> platform2
+goal_strategy: cube_sorting
+goal_params:
+  small_predicate: small
+  target_true: platform1
+  target_false: platform2

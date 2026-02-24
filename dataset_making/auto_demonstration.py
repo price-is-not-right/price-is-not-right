@@ -2,6 +2,7 @@ import os, argparse, time, zipfile, pickle, copy
 import numpy as np
 import robosuite as suite
 import robosuite_task_zoo
+from graph_learner import GraphLearner
 from datetime import datetime
 import gymnasium as gym
 # import gym
@@ -58,6 +59,9 @@ class RecordDemos(gym.Wrapper):
         self.render = render
         self.randomize = randomize
         self.noise_std_factor = noise_std_factor
+
+        # Initialize the graph learner
+        self.Graph = GraphLearner(file_path=args.graphs)
 
         # Set up the environment
         self.gripper_body = self.env.sim.model.body_name2id('gripper0_eef')
@@ -188,8 +192,7 @@ class RecordDemos(gym.Wrapper):
                             'language_instruction': step,
                         })
             np.save(f'data/kitchen_env/episode_{self.recorded_eps}.npy', episode)
-            np.save(f'data/hanoi_dataset/data/episode_{num_recorded_eps}.npy', episode)
-        
+
         else:
             for step in self.action_steps:
                 print(step)
@@ -244,18 +247,42 @@ class RecordDemos(gym.Wrapper):
             self.episode_buffer[action_step] = [action, next_obs]
         else:
             self.episode_buffer[action_step] += [action, next_obs]
+        state = copy.deepcopy(state_memory)
+        if new_state != state:
+            # Check if the change is linked a grounded predicate 'on(o1,o2)' or 'clear(o1)'
+            transition = {k: new_state[k] for k in new_state if k not in state or new_state[k] != state[k]}
+            # If any key in transition has 'on' in it and verify that the value associated with that key is 1.0
+            if self.switched_graph_state(transition):
+                # Change detected
+                # Filter only the keys that have 'on' in them
+                state_memory = copy.deepcopy(new_state)
+                state = {k: state[k] for k in state if 'on' in k}
+                new_state = {k: new_state[k] for k in new_state if 'on' in k}
+                # Filter only the values that are True
+                state = {key: value for key, value in state.items() if value}
+                new_state = {key: value for key, value in new_state.items() if value}
+                # if state has not 3 keys, return None
+                if len(state) != 3 or len(new_state) != 3:
+                    return None
+                # Check if cubes have fallen from other subes, i.e., check if two or more cubes are on the same peg
+                for test_state in [state, new_state]:
+                    pegs = []
+                    for relation, value in test_state.items():
+                        _, peg = relation.split('(')[1].split(',')
+                        pegs.append(peg)
+                    if len(pegs) != len(set(pegs)):
+                        return None
+                if self.args.unique:
+                    # Check if the transition is unique
+                    if self.Graph.is_known_edge(state, sym_action, new_state):
+                        # Already known transition
+                        return None
+                self.Graph.learn(state, sym_action, new_state)
+                self.symbolic_buffer.append((state, sym_action, new_state))
+                self.task_buffer.append((self.obj_to_pick, self.place_to_drop, len(self.episode_buffer[action_step])))
+                state = new_state
+
         return state_memory
-        # else:
-        #     keypoint = self.relative_obs_mapping(goal)
-        #     transition = (obs, action, next_obs, keypoint, reward, done)
-        #     if action_step not in self.action_steps:
-        #         self.action_steps.append(action_step)
-        #     if action_step not in self.episode_buffer.keys():
-        #         self.episode_buffer[action_step] = [transition]
-        #     else:
-        #         self.episode_buffer[action_step].append(transition)
-        #     self.task_buffer.append(self.task)
-        #     return state_memory
 
     def cap(self, eps, max_val=0.12, min_val=0.01):
         """
@@ -297,7 +324,14 @@ class RecordDemos(gym.Wrapper):
         aperture = np.linalg.norm(left_finger_pos - right_finger_pos)
 
         return np.array([dist, angle, aperture])
-        
+
+    def switched_graph_state(self, transition, mode='simple'):
+        if mode == 'simple':
+            if any(['on' in k and transition[k] == 1.0 for k in transition]):
+                if not(any(['grasped' in k and transition[k] == 1.0 for k in transition])):
+                    return True
+        return False
+
     def quaternion_to_euler(self, quat):
         """
         Converts a quaternion to euler angles
@@ -792,9 +826,11 @@ if __name__ == "__main__":
     print("Starting experiment {}.".format(os.path.join(experiment_name, experiment_id)))
 
     # Create the directories
+    args.graphs = args.experiment_dir + '/graphs/'
     args.traces = args.env_dir + '/traces/'
     os.makedirs(args.env_dir, exist_ok=True)
     os.makedirs(args.traces, exist_ok=True)
+    os.makedirs(args.graphs, exist_ok=True)
 
     # Load the controller config
     controller_config = suite.load_controller_config(default_controller='OSC_POSE')
@@ -864,6 +900,7 @@ if __name__ == "__main__":
         done = env.run_trajectory(obs)
         if done:
             obs = env.save_trajectory()
+            print("\n Graph mapping: ", env.Graph.state_mapping)
         episode += 1
         print("Number of recorded episodes: {}".format(env.recorded_eps))
         print("\n\n")

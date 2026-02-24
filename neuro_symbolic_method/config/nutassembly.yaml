@@ -1,0 +1,52 @@
+env_name: NutAssembly
+detector: NutAssemblyDetector
+planning_mode: 0
+planning_predicates: [on, clear, grasped]
+
+pddl_path: planning/PDDL/nut_assembly.pddl
+yolo_model: models/yolo/nut_assembly_yolo.pt
+regressor_model: models/regressors/nut_assembly_regressor.pkl
+
+policies:
+  grasp: policies/nut_assembly/grasp.ckpt
+  drop: policies/nut_assembly/drop.ckpt
+  reach_pick: policies/nut_assembly/reach_pick.ckpt
+  reach_place: policies/nut_assembly/reach_drop.ckpt
+
+object_mapping:
+  nut1: o1
+  nut2: o2
+  bolt1: o3
+  bolt2: o4
+  plate: o5
+
+executors:
+  - id: ReachPick
+    policy_key: reach_pick
+    termination_condition: reach_pick
+    nulified_action_indexes: [3]
+    oracle: true
+    horizon_formula: "8/n_act*55"
+
+  - id: Pick
+    policy_key: grasp
+    termination_condition: pick
+    nulified_action_indexes: [0, 1]
+    oracle: true
+    horizon_formula: "8/n_act*20"
+
+  - id: ReachDrop
+    policy_key: reach_place
+    termination_condition: reach_drop
+    nulified_action_indexes: [3]
+    oracle: true
+    horizon_formula: "8/n_act*55"
+
+  - id: Drop
+    policy_key: drop
+    termination_condition: drop
+    nulified_action_indexes: [0, 1]
+    oracle: true
+    horizon_formula: "8/n_act*20"
+
+goal_strategy: default

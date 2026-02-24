@@ -1,0 +1,35 @@
+(define (problem hanoi)
+  (:domain hanoi)
+  (:objects 
+    cube1 cube2 cube3 cube4 - disk
+    peg1 peg2 peg3 - peg
+  )
+  (:init 
+    (free-gripper)
+    (smaller cube1 cube2)
+    (smaller cube1 cube3)
+    (smaller cube1 cube4)
+    (smaller cube1 peg1)
+    (smaller cube1 peg2)
+    (smaller cube1 peg3)
+    (smaller cube2 cube3)
+    (smaller cube2 cube4)
+    (smaller cube2 peg1)
+    (smaller cube2 peg2)
+    (smaller cube2 peg3)
+    (smaller cube3 cube4)
+    (smaller cube3 peg1)
+    (smaller cube3 peg2)
+    (smaller cube3 peg3)
+    (smaller cube4 peg1)
+    (smaller cube4 peg2)
+    (smaller cube4 peg3)
+  )
+  (:goal 
+    (and (on cube4 peg3)
+         (on cube3 cube4)
+         (on cube2 cube3)
+         (on cube1 cube2))
+  )
+)
+

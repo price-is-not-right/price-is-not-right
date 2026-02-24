@@ -1,0 +1,35 @@
+(define (problem assemblyline)
+  (:domain assemblyline)
+  (:objects 
+    cube0 cube1 cube2 cube3 cube4 cube5 - disk
+    bin0 bin1 bin2 bin3 bin4 bin5 table - peg
+  )
+  (:init 
+(type_match cube3 bin0 )
+(type_match cube2 bin2 )
+(type_match cube1 bin1 )
+(type_match cube0 bin0 )
+(clear cube3 )
+(clear cube2 )
+(clear cube1 )
+(clear cube0 )
+(clear bin2 )
+(clear bin1 )
+(clear bin0 )
+    (free-gripper)    
+    (on cube0 table)
+    (on cube1 table)
+    (on cube2 table)
+    (on cube3 table)
+    (on cube4 table)
+    (on cube5 table)
+  )
+  (:goal 
+    (and
+      (on cube0 bin0)
+      (on cube1 bin1)
+      (on cube2 bin2)
+      (on cube3 bin0)
+    )
+  )
+)

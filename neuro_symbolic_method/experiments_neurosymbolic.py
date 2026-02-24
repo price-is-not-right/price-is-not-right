@@ -1,289 +1,264 @@
 import warnings
 warnings.filterwarnings("ignore")
 
-
+import os
 import argparse
 import gym
 import joblib
+import yaml
 import robosuite as suite
 import numpy as np
-from statistics import mean 
+from statistics import mean
 from robosuite.wrappers import GymWrapper
-from robosuite.utils.detector import HanoiDetector, KitchenDetector, NutAssemblyDetector, CubeSortingDetector, HeightStackingDetector, AssemblyLineSortingDetector, PatternReplicationDetector
-from planning.planner import *
-from planning.executor import *
+from robosuite.utils.detector import (
+    HanoiDetector, KitchenDetector, NutAssemblyDetector,
+    CubeSortingDetector, HeightStackingDetector,
+    AssemblyLineSortingDetector, PatternReplicationDetector,
+)
+from planning.planner import (
+    add_predicates_to_pddl, define_goal_in_pddl, call_planner
+)
+from planning.executor import Executor_Diffusion
 from ultralytics import YOLO
+import wandb
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+DETECTOR_REGISTRY = {
+    "HanoiDetector": HanoiDetector,
+    "KitchenDetector": KitchenDetector,
+    "NutAssemblyDetector": NutAssemblyDetector,
+    "CubeSortingDetector": CubeSortingDetector,
+    "HeightStackingDetector": HeightStackingDetector,
+    "AssemblyLineSortingDetector": AssemblyLineSortingDetector,
+    "PatternReplicationDetector": PatternReplicationDetector,
+}
+
+CONFIG_FILE_REGISTRY = {
+    "Hanoi": "configs/hanoi.yaml",
+    "KitchenEnv": "configs/kitchenenv.yaml",
+    "NutAssembly": "configs/nutassembly.yaml",
+    "CubeSorting": "configs/cubesorting.yaml",
+    "HeightStacking": "configs/heightstacking.yaml",
+    "AssemblyLineSorting": "configs/assemblylinesort.yaml",
+    "PatternReplication": "configs/patternreplication.yaml",
+}
+
+# Termination conditions registry — logic stays in Python, keyed by name
+TERMINATION_CONDITIONS = {
+    "pick":       lambda state, symgoal: state[f"picked_up({symgoal[0]})"],
+    "drop":       lambda state, symgoal: state[f"on({symgoal[0]},{symgoal[1]})"] and not state[f"grasped({symgoal[0]})"],
+    "reach_pick": lambda state, symgoal: state[f"over(gripper,{symgoal[0]})"],
+    "reach_drop": lambda state, symgoal: state[f"over(gripper,{symgoal[1]})"],
+    "turnon":     lambda state, symgoal: state["stove_on()"],
+    "turnoff":    lambda state, symgoal: not state["stove_on()"],
+    "default":    lambda state, symgoal: False,
+}
+
+RESET_GRIPPER_POS = np.array([-0.080193391, -0.03391656, 0.95828137])
+
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+def load_env_config(env_name: str) -> dict:
+    config_path = CONFIG_FILE_REGISTRY[env_name]
+    with open(config_path) as f:
+        return yaml.safe_load(f)
 
 
-env_detectors = {
-    "Hanoi": HanoiDetector,
-    "KitchenEnv": KitchenDetector,
-    "NutAssembly": NutAssemblyDetector,
-    "CubeSorting": CubeSortingDetector,
-    "HeightStacking": HeightStackingDetector,
-    "AssemblyLineSorting": AssemblyLineSortingDetector,
-    "PatternReplication": PatternReplicationDetector
-}
-planning_predicates = {
-    "Hanoi": ['on', 'clear', 'grasped'],
-    "KitchenEnv": ['on', 'clear', 'grasped', 'stove_on'],
-    "NutAssembly": ['on', 'clear', 'grasped'],
-    "CubeSorting": ['on', 'clear', 'grasped', 'type_match'],
-    "HeightStacking": ['on', 'clear', 'grasped', 'smaller'],
-    "AssemblyLineSorting": ['on', 'clear', 'grasped', 'type_match'],
-    "PatternReplication": ['on', 'clear', 'grasped']}
-planning_mode = {
-    "Hanoi": 0,
-    "KitchenEnv": 1,
-    "NutAssembly": 0,
-    "CubeSorting": 0,
-    "HeightStacking": 0,
-    "AssemblyLineSorting": 0,
-    "PatternReplication": 0}
-env_detectors = {
-    "Hanoi": HanoiDetector,
-    "KitchenEnv": KitchenDetector,
-    "NutAssembly": NutAssemblyDetector,
-    "CubeSorting": CubeSortingDetector,
-    "HeightStacking": HeightStackingDetector,
-    "AssemblyLineSorting": AssemblyLineSortingDetector,
-    "PatternReplication": PatternReplicationDetector
-}
-pddl_paths = {
-    "Hanoi": "planning/PDDL/hanoi/",
-    "KitchenEnv": "planning/PDDL/kitchen.pddl",
-    "NutAssembly": "planning/PDDL/nut_assembly.pddl",
-    "CubeSorting": "planning/PDDL/cubesorting/",
-    "HeightStacking": "planning/PDDL/heightstacking/",
-    "AssemblyLineSorting": "planning/PDDL/assemblyline/",
-    "PatternReplication": "planning/PDDL/patternreplication/"
-}
-yolo_model_paths = {
-    "Hanoi": "models/yolo/hanoi_yolo.pt",
-    "KitchenEnv": "models/yolo/kitchen_yolo.pt",
-    "NutAssembly": "models/yolo/nut_assembly_yolo.pt",
-    "CubeSorting": "models/yolo/hanoi_yolo.pt",
-    "HeightStacking": "models/yolo/hanoi_yolo.pt",
-    "AssemblyLineSorting": "models/yolo/hanoi_yolo.pt",
-    "PatternReplication": "models/yolo/hanoi_yolo.pt"
-}
-regressor_model_paths = {
-    "Hanoi": "models/regressors/hanoi_regressor.pkl",
-    "KitchenEnv": "models/regressors/kitchen_regressor.pkl",
-    "NutAssembly": "models/regressors/nut_assembly_regressor.pkl",
-    "CubeSorting": "models/regressors/hanoi_regressor.pkl",
-    "HeightStacking": "models/regressors/hanoi_regressor.pkl",
-    "AssemblyLineSorting": "models/regressors/hanoi_regressor.pkl",
-    "PatternReplication": "models/regressors/hanoi_regressor.pkl"
-}
-env_pddl_mapping = {
-    "Hanoi": {'cube1': 'o1', 'cube2': 'o2', 'cube3': 'o3', 'peg1': 'o4', 'peg2': 'o5', 'peg3': 'o6'},
-    "KitchenEnv": {'bread': 'o1', 'pot': 'o2', 'stove': 'o3', 'serving': 'o4', 'table': 'o5'},
-    "NutAssembly": {'nut1': 'o1', 'nut2': 'o2', 'bolt1': 'o3', 'bolt2': 'o4', 'plate': 'o5'},
-    "CubeSorting": {'cube1': 'o1', 'cube2': 'o2', 'cube3': 'o3', 'peg1': 'o4', 'peg2': 'o5', 'peg3': 'o6'},
-    "HeightStacking": {'cube1': 'o1', 'cube2': 'o2', 'cube3': 'o3', 'peg1': 'o4', 'peg2': 'o5', 'peg3': 'o6'},
-    "AssemblyLineSorting": {'cube1': 'o1', 'cube2': 'o2', 'cube3': 'o3', 'peg1': 'o4', 'peg2': 'o5', 'peg3': 'o6'},
-    "PatternReplication": {'cube1': 'o1', 'cube2': 'o2', 'cube3': 'o3', 'peg1': 'o4', 'peg2': 'o5', 'peg3': 'o6'}
-}
-policies_paths = {
-    "Hanoi": {"grasp": "policies/hanoi/grasp.ckpt",
-              "drop": "policies/hanoi/drop.ckpt",
-              "reach_pick": "policies/hanoi/reach_pick.ckpt",
-              "reach_place": "policies/hanoi/reach_drop.ckpt"},
-    "CubeSorting": {"grasp": "policies/hanoi/grasp.ckpt",
-                     "drop": "policies/hanoi/drop.ckpt",
-                     "reach_pick": "policies/hanoi/reach_pick.ckpt",
-                     "reach_place": "policies/hanoi/reach_drop.ckpt"},
-    "HeightStacking": {"grasp": "policies/hanoi/grasp.ckpt",
-                        "drop": "policies/hanoi/drop.ckpt",
-                        "reach_pick": "policies/hanoi/reach_pick.ckpt",
-                        "reach_place": "policies/hanoi/reach_drop.ckpt"},
-    "AssemblyLineSorting": {"grasp": "policies/hanoi/grasp.ckpt",
-                             "drop": "policies/hanoi/drop.ckpt",
-                             "reach_pick": "policies/hanoi/reach_pick.ckpt",
-                             "reach_place": "policies/hanoi/reach_drop.ckpt"},
-    "PatternReplication": {"grasp": "policies/hanoi/grasp.ckpt",
-                            "drop": "policies/hanoi/drop.ckpt",
-                            "reach_pick": "policies/hanoi/reach_pick.ckpt",
-                            "reach_place": "policies/hanoi/reach_drop.ckpt"},
-    "NutAssembly": {"grasp": "policies/nut_assembly/grasp.ckpt",
-                      "drop": "policies/nut_assembly/drop.ckpt",
-                      "reach_pick": "policies/nut_assembly/reach_pick.ckpt",
-                      "reach_place": "policies/nut_assembly/reach_drop.ckpt"},
-    "KitchenEnv": {"grasp": "policies/kitchen/grasp.ckpt",
-                    "drop": "policies/kitchen/drop.ckpt",
-                    "reach_pick": "policies/kitchen/reach_pick.ckpt",
-                    "reach_place": "policies/kitchen/reach_drop.ckpt"}}
+# ---------------------------------------------------------------------------
+# Executor building
+# ---------------------------------------------------------------------------
 
-def get_plan(state, pddl_path, mode):
-    # Generate the plan
-    init_predicates = {predicate: True for predicate in state.keys() if state[predicate] and predicate.split("(")[0] in planning_predicates[args.env]}
-    # Remove all predicates regarding reference objects from the PDDL file
-    copy_init_predicates = init_predicates.copy()
-    for predicate in copy_init_predicates.keys():
-        if "ref" in predicate:
-            init_predicates.pop(predicate)
-    add_predicates_to_pddl(pddl_path, init_predicates)
-    # Get goal from initial state
-    # For Hanoi, KitchenEnv and NutAssembly, do nothing
-    # For CubeSorting, find all small cubes and write the goal as on(cube, target_zone)
-    if args.env == "CubeSorting":
+def build_executors(cfg: dict, n_act: int, debug: bool) -> list:
+    policies = cfg["policies"]
+    executors = []
+    for spec in cfg["executors"]:
+        horizon = eval(spec["horizon_formula"], {"n_act": n_act})
+        executor = Executor_Diffusion(
+            id=spec["id"],
+            policy=policies[spec["policy_key"]],
+            Beta=TERMINATION_CONDITIONS[spec["termination_condition"]],
+            nulified_action_indexes=spec["nulified_action_indexes"],
+            oracle=spec["oracle"],
+            horizon=horizon,
+            debug=debug,
+        )
+        executors.append(executor)
+    return executors
+
+
+# ---------------------------------------------------------------------------
+# Goal generation
+# ---------------------------------------------------------------------------
+
+def build_goal_predicates(cfg: dict, state: dict, detector) -> list:
+    strategy = cfg["goal_strategy"]
+    params = cfg.get("goal_params", {})
+
+    if strategy == "default":
+        return []
+
+    elif strategy == "cube_sorting":
+        small_pred = params["small_predicate"]
         goal_predicates = []
-        for predicate in state.keys():
-            if "small" in predicate and state[predicate]:
-                objs = predicate[predicate.find("(")+1:predicate.find(")")].split(", ")
-                goal_predicates.append(f'on {objs[0]} platform1')
-            elif "small" in predicate and not state[predicate]:
-                objs = predicate[predicate.find("(")+1:predicate.find(")")].split(", ")
-                goal_predicates.append(f'on {objs[0]} platform2')
-        goal_str = "\n".join(goal_predicates)
-        print("Goal predicates: ", goal_str)
-    elif args.env == "HeightStacking":
-        goal_predicates = []
+        for predicate, value in state.items():
+            if small_pred in predicate:
+                obj = predicate[predicate.find("(") + 1:predicate.find(")")].split(", ")[0]
+                target = params["target_true"] if value else params["target_false"]
+                goal_predicates.append(f"on {obj} {target}")
+        return goal_predicates
+
+    elif strategy == "height_stacking":
+        size_pred = params["size_predicate"]
+        base = params["base_location"]
         sizes = {}
-        for predicate in state.keys():
-            if "smaller" in predicate and state[predicate]:
-                objs = predicate[predicate.find("(")+1:predicate.find(")")].split(",")
+        for predicate, value in state.items():
+            if size_pred in predicate and value:
+                objs = predicate[predicate.find("(") + 1:predicate.find(")")].split(",")
                 sizes[objs[0]] = objs[1]
-        # Create stacking order based on sizes
         sorted_sizes = sorted(sizes.items(), key=lambda x: x[1])
-        for i in range(len(sorted_sizes)-1):
-            goal_predicates.append(f'on {sorted_sizes[i][0]} {sorted_sizes[i+1][0]}')
-        goal_str = "\n".join(goal_predicates)
-        # Add largest cube on platform
-        goal_predicates.append(f'on {sorted_sizes[-1][0]} platform')
-        print("Goal predicates: ", goal_str)
-    elif args.env == "AssemblyLineSorting":
+        goal_predicates = [
+            f"on {sorted_sizes[i][0]} {sorted_sizes[i + 1][0]}"
+            for i in range(len(sorted_sizes) - 1)
+        ]
+        goal_predicates.append(f"on {sorted_sizes[-1][0]} {base}")
+        return goal_predicates
+
+    elif strategy == "type_match":
+        match_pred = params["match_predicate"]
         goal_predicates = []
-        types = {}
-        for predicate in state.keys():
-            if "type_match" in predicate and state[predicate]:
-                objs = predicate[predicate.find("(")+1:predicate.find(")")].split(",")
-                types[objs[0]] = objs[1]
-        for obj, type_ in types.items():
-            goal_predicates.append(f'on {obj} {type_}')
-        goal_str = "\n".join(goal_predicates)
-        print("Goal predicates: ", goal_str)
-    elif args.env == "PatternReplication":
-        goal_predicates = detector.get_pattern_replication_goal()
-        goal_str = "\n".join(goal_predicates)
-        print("Goal predicates: ", goal_str)
+        for predicate, value in state.items():
+            if match_pred in predicate and value:
+                objs = predicate[predicate.find("(") + 1:predicate.find(")")].split(",")
+                goal_predicates.append(f"on {objs[0]} {objs[1]}")
+        return goal_predicates
+
+    elif strategy == "pattern_replication":
+        return detector.get_pattern_replication_goal()
+
+    else:
+        raise ValueError(f"Unknown goal strategy: {strategy}")
+
+
+def get_plan(state: dict, cfg: dict, detector) -> tuple:
+    planning_predicates = cfg["planning_predicates"]
+    pddl_path = cfg["pddl_path"]
+    mode = cfg["planning_mode"]
+
+    init_predicates = {
+        pred: True
+        for pred, val in state.items()
+        if val and pred.split("(")[0] in planning_predicates and "ref" not in pred
+    }
+    add_predicates_to_pddl(pddl_path, init_predicates)
+
+    goal_predicates = build_goal_predicates(cfg, state, detector)
     define_goal_in_pddl(pddl_path, goal_predicates)
+
     plan, _ = call_planner(pddl_path, mode=mode)
     return plan, goal_predicates
 
-if __name__ == "__main__":
 
-    # Define the command line arguments
+# ---------------------------------------------------------------------------
+# Environment wrapper
+# ---------------------------------------------------------------------------
+
+class DictObs(gym.Env):
+    def __init__(self, env):
+        super().__init__()
+        self.env = env
+        self.action_space = env.action_space
+        self.observation_space = env.observation_space
+
+    def reset(self):
+        self.env.reset()
+        return self.env._get_observations()
+
+    def step(self, action):
+        _, reward, terminated, truncated, info = self.env.step(action)
+        return self.env._get_observations(), reward, terminated or truncated, info
+
+    def render(self, mode="human", *args, **kwargs):
+        self.env.render()
+
+    def _get_observations(self):
+        return self.env._get_observations()
+
+    def __getattr__(self, name):
+        return getattr(self.env, name)
+
+
+# ---------------------------------------------------------------------------
+# Gripper reset
+# ---------------------------------------------------------------------------
+
+def reset_gripper(env, detector, render: bool):
+    print("Resetting gripper")
+    state = detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
+    while not state["open_gripper(gripper)"]:
+        env.step(np.array([0, 0, 0, -1]))
+        state = detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
+        if render:
+            env.render()
+
+    for _ in range(50):
+        env.step(np.array([0, 0, 0.5, 0]))
+        if render:
+            env.render()
+
+    gripper_pos = env._get_observations()["robot0_eef_pos"]
+    delta = RESET_GRIPPER_POS - gripper_pos
+    while np.linalg.norm(delta) > 0.01:
+        action = 5 * np.array([delta[0], delta[1], delta[2], 0]) * 0.9
+        env.step(action)
+        if render:
+            env.render()
+        gripper_pos = env._get_observations()["robot0_eef_pos"]
+        delta = RESET_GRIPPER_POS - gripper_pos
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--env', type=str, default='Hanoi', choices=['Hanoi', 'KitchenEnv', 'NutAssembly', 'CubeSorting', 'AssemblyLineSorting', 'HeightStacking', 'PatternReplication'], help='Name of the environment to run the experiment in')
-    parser.add_argument('--render', action='store_true', help='Render the environment')
-    parser.add_argument('--seed', type=int, default=0, help='Random seed')
-    parser.add_argument('--size', type=int, default=256, help='Size of the rendered images')
-    parser.add_argument('--rnd_reset', action='store_true', help='Randomize the object positions at reset')
-    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
-    parser.add_argument('--n_act', type=int, default=4, help='Number of actions to execute per policy call')
+    parser.add_argument("--env", type=str, default="Hanoi",
+                        choices=list(CONFIG_FILE_REGISTRY.keys()))
+    parser.add_argument("--render", action="store_true")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--size", type=int, default=256)
+    parser.add_argument("--rnd_reset", type=float, default=0.025)
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--n_act", type=int, default=4)
+    parser.add_argument("--n_ep", type=int, default=100)
     args = parser.parse_args()
+
     np.random.seed(args.seed)
 
-    def termination_indicator(operator):
-        if operator == 'pick':
-            def Beta(state, symgoal):
-                condition = state[f"grasped({symgoal[0]})"]
-                return condition
-        elif operator == 'drop':
-            def Beta(state, symgoal):
-            # print("State in drop Beta: ", state)
-            # print("Symgoal in drop Beta: ", symgoal)
-            # print("Checking condition: ", f"on({symgoal[0]},{symgoal[1]})", state[f"on({symgoal[0]},{symgoal[1]})"])
-            # print("Checking condition: ", f"grasped({symgoal[0]})", state[f"grasped({symgoal[0]})"])
-            # print("Condition value: ", state[f"on({symgoal[0]},{symgoal[1]})"] and not state[f"grasped({symgoal[0]})"])
-            # print("-----------------------------------")
-                condition = state[f"in({symgoal[0]},{symgoal[1]})"] and not state[f"grasped({symgoal[0]})"]
-                return condition
-        elif operator == 'reach_pick':
-            def Beta(state, symgoal):
-                condition = state[f"over(gripper,{symgoal[0]})"]
-                return condition
-        elif operator == 'reach_drop':
-            def Beta(state, symgoal):
-                condition = state[f"over(gripper,{symgoal[1]})"]
-                return condition
-        elif operator == 'turnon':
-            def Beta(state, symgoal):
-                condition = state[f'stove_on()']
-                return condition
-        elif operator == 'turnoff':
-            def Beta(state, symgoal):
-                condition = not(state[f'stove_on()'])
-                return condition
-        else:
-            def Beta(state, symgoal):
-                condition = False
-                return condition
-        return Beta
+    # WandB
+    wandb.init(
+        project="vlas-cycliclxm",
+        name="neurosymbolic-experiment-hs3",
+        settings=wandb.Settings(x_stats_sampling_interval=0.5),
+    )
 
-    class DictObs(gym.Env):
-        def __init__(self, env):
-            super().__init__()
-            self.env = env
-            self.action_space = env.action_space
-            self.observation_space = env.observation_space
+    # Load config
+    cfg = load_env_config(args.env)
 
-        def reset(self):
-            self.env.reset()
-            return self.env._get_observations()
+    # Build executors
+    actions = build_executors(cfg, args.n_act, args.debug)
 
-        def step(self, action):
-            _, reward, terminated, truncated, info = self.env.step(action)
-            return self.env._get_observations(), reward, terminated or truncated, info
+    # Load models
+    yolo_model = YOLO(cfg["yolo_model"])
+    regressor_model = joblib.load(cfg["regressor_model"])
 
-        def render(self, mode='human', *args, **kwargs):
-            self.env.render()
-
-        def _get_observations(self):
-            return self.env._get_observations()
-        
-        def __getattr__(self, name):
-            return getattr(self.env, name)
-
-
-    # # Load executors
-    pick = Executor_Diffusion(id='Pick', 
-                       policy=policies_paths[args.env]['grasp'],
-                       Beta=termination_indicator('pick'),
-                       nulified_action_indexes=[0, 1],
-                       oracle=True,
-                       horizon=8/args.n_act*25,
-                       debug=args.debug)
-    reach_pick = Executor_Diffusion(id='ReachPick', 
-                            policy=policies_paths[args.env]['reach_pick'],
-                            Beta=termination_indicator('reach_pick'),
-                            nulified_action_indexes=[3],
-                            oracle=True,
-                            horizon=8/args.n_act*25,
-                            debug=args.debug)
-    reach_place = Executor_Diffusion(id='ReachDrop', 
-                            policy=policies_paths[args.env]['reach_place'],
-                            Beta=termination_indicator('reach_drop'),
-                            nulified_action_indexes=[3],
-                            oracle=True,
-                            horizon=8/args.n_act*35,
-                            debug=args.debug)
-    drop = Executor_Diffusion(id='Drop', 
-                    policy=policies_paths[args.env]['drop'],
-                    Beta=termination_indicator('drop'),
-                    nulified_action_indexes=[0, 1],
-                    oracle=True,
-                    horizon=8/args.n_act*25,
-                    debug=args.debug)
-
-    Move_action = [reach_pick, pick, reach_place, drop]
-
-    # Load the controller config
-    controller_config = suite.load_controller_config(default_controller='OSC_POSITION')
-
-    # Create the environment
+    # Build robosuite environment
+    controller_config = suite.load_controller_config(default_controller="OSC_POSITION")
     env = suite.make(
         env_name=args.env,
         robots="Kinova3",
@@ -298,204 +273,140 @@ if __name__ == "__main__":
         camera_names=["agentview", "robot0_eye_in_hand"],
         camera_heights=args.size,
         camera_widths=args.size,
-        #random_block_placement=args.rnd_reset
+        cube_placement_noise=args.rnd_reset,
     )
-    detector = env_detectors[args.env](env)
-    # Wrap the environment with the GymWrapper
-    env = GymWrapper(env)
-    env = DictObs(env)
-    pddl_path = pddl_paths[args.env]
-    obj_mapping = env_pddl_mapping[args.env]
-    yolo_model = YOLO(yolo_model_paths[args.env])
-    regressor_model = joblib.load(regressor_model_paths[args.env])
+    detector = DETECTOR_REGISTRY[cfg["detector"]](env)
+    env = DictObs(GymWrapper(env))
+
     n_obs = 4
-
-    env.reset()
-    state = detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
-    print("Initial state: ", state)
-
-    # Create a lambda function that maps "on(cube1,peg1)" to "p1(o1,o3)"
-    def map_predicate(predicate):
-        # Extract the objects from the predicate
-        objects = predicate.split('(')[1].split(')')[0].split(',')
-        return f"p1({obj_mapping[objects[0]]},{obj_mapping[objects[1]]})"
-    def change_predicate(predicate):
-        # Extract the objects from the predicate
-        objects = predicate.split('(')[1].split(')')[0].split(',')
-        return f"p1({obj_mapping[objects[0]]},{obj_mapping[objects[0]]})"
-    # Filter and keep only the predicates that are "on" and are True and map them to the PDDL format
-    #init_predicates = {map_predicate(predicate): True for predicate in state.keys() if predicate[:3] == "on(" and state[predicate]}
-    # Filter and keep only the predicates that are "clear" and are True and map them to the PDDL format
-    #init_predicates.update({change_predicate(predicate): True for predicate in state.keys() if 'clear' in predicate and state[predicate]})
-    init_predicates = {predicate: True for predicate in state.keys() if state[predicate] and predicate.split("(")[0] in planning_predicates[args.env]}
-    #print("Initial predicates: ", init_predicates)
-    # Usage
-    # Remove all predicates regarding reference objects from the PDDL file
-    copy_init_predicates = init_predicates.copy()
-    for predicate in copy_init_predicates.keys():
-        if "ref" in predicate:
-            init_predicates.pop(predicate)
-    print("Initial predicates: ", init_predicates)
-
-    reset_gripper_pos = np.array([-0.080193391, -0.03391656,  0.95828137])
     episode_successes = 0
     num_valid_pick_place_queries = 0
-    pick_place_success = 0
+    valid_pick_place_success = 0
     pick_place_successes = []
     percentage_advancement = []
-    valid_pick_place_success = 0
-
-    def reset_gripper(env):
-        print("Resetting gripper")
-        # First open the gripper
-        state = detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
-        while not(state["open_gripper(gripper)"]):
-            #print(state["open_gripper(gripper)"])
-            action = np.array([0, 0, 0, -1])
-            env.step(action)
-            state = detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
-            if args.render:
-                env.render()
-        # Then move the gripper to the initial position
-        for _ in range(50):
-            action = np.array([0, 0, 0.5, 0])
-            env.step(action)
-            if args.render:
-                env.render()
-        gripper_pos = env._get_observations()["robot0_eef_pos"]
-        delta = reset_gripper_pos - gripper_pos
-        action = 5*np.array([delta[0], delta[1], delta[2], 0])
-        while np.linalg.norm(delta) > 0.01:
-            #print("Curent pos: ", gripper_pos)
-            #print("Reset pos: ", reset_gripper_pos)
-            action = 5*np.array([delta[0], delta[1], delta[2], 0])
-            action = action * 0.9
-            env.step(action)
-            if args.render:
-                env.render()
-            gripper_pos = env._get_observations()["robot0_eef_pos"]
-            delta = reset_gripper_pos - gripper_pos
-            #print(f"Delta: {delta}, Current pos: {gripper_pos}, Reset pos: {reset_gripper_pos}, Action: {action}")
     retry_reset = False
-    for i in range(100):
+
+    for i in range(args.n_ep):
         if retry_reset:
             i -= 1
-        print("Episode: ", i)
-        success = False
-        valid_state = False
+        print(f"Episode: {i}")
         plan = False
         goal_reached = False
         np.random.seed(args.seed + i)
-        # Reset the environment until a valid state is reached
-        while plan == False:
-            # Reset the environment
+
+        # Reset until a valid plan is found
+        while plan is False:
             env.reset()
             if args.render:
                 env.render()
+
             observations = []
             for _ in range(args.n_act):
                 env.step(np.zeros(env.action_space.shape))
                 obs = env._get_observations()
-                objects_pos = detector.get_all_objects_pos()
-                obs['objects_pos'] = objects_pos
+                obs["objects_pos"] = detector.get_all_objects_pos()
                 observations.append(obs)
-            # Get only the last n_obs observations
             observations = observations[-n_obs:]
+
             state = detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
-            #print("Initial state: ", state)
-            # Generate a plan
-            plan, goal_predicates = get_plan(state, pddl_path, mode=planning_mode[args.env])
-        print("Plan: ", plan)
-        print("Goal predicates: ", goal_predicates)
+            plan, goal_predicates = get_plan(state, cfg, detector)
+
+        print(f"Plan: {plan}")
+        print(f"Goal predicates: {goal_predicates}")
 
         pick_place_success = 0
-        # Execute the first operator in the plan
-        reset_gripper(env)
+        reset_gripper(env, detector, args.render)
         tracking_data = {}
+
         for j, operator in enumerate(plan):
-            print("\nExecuting operator: ", operator)
-            # Concatenate the observations with the operator effects
-            #obj_to_pick = obj_mapping[operator.split(' ')[2].lower()]
-            #obj_to_drop = obj_mapping[operator.split(' ')[3].lower()]
-            if j%2 == 0:
-                obj_to_pick = operator.split(' ')[-2].lower()
+            print(f"\nExecuting operator: {operator}")
+
+            # Operators come in reach/act pairs; collect obj_to_pick on even steps
+            if j % 2 == 0:
+                obj_to_pick = operator.split(" ")[-2].lower()
                 continue
             else:
-                obj_to_drop = operator.split(' ')[-1].lower()
+                obj_to_drop = operator.split(" ")[-1].lower()
 
             num_valid_pick_place_queries += 1
-            if operator.split(' ')[0].lower() == "turnon":
-                skill = Turnon_action
+            op_name = operator.split(" ")[0].lower()
+
+            if op_name == "turnon":
+                skill = actions[-1]
                 print("Turn On action")
-            elif operator.split(' ')[0].lower() == "turnoff":
-                skill = Turnoff_action
+            elif op_name == "turnoff":
+                skill = actions[-2]
                 print("Turn Off action")
-            elif operator.split(' ')[0].lower() == "wait":
+            elif op_name == "wait":
                 skill = []
                 print("Wait action")
             else:
-                skill = Move_action
-                print("Picking object: {}, Dropping object: {}".format(obj_to_pick, obj_to_drop))
+                skill = actions[:4]
+                print(f"Picking: {obj_to_pick}, Dropping on: {obj_to_drop}")
+
             for action_step in skill:
-                action_step.load_policy(detector=detector, 
-                                        yolo_model=yolo_model,
-                                        regressor_model=regressor_model, 
-                                        image_size=args.size)
+                action_step.load_policy(
+                    detector=detector,
+                    yolo_model=yolo_model,
+                    regressor_model=regressor_model,
+                    image_size=args.size,
+                )
                 if tracking_data:
                     action_step.set_tracking_data(tracking_data)
-                print("\tExecuting action: ", action_step.id)
-                sub_goal = (obj_to_pick, obj_to_drop)
-                task_goals = goal_predicates.copy()
-                observations, success, goal_reached = action_step.execute(env, observations, args.n_act, sub_goal, task_goals, args.render)
-                tracking_data = action_step.get_tracking_data()
 
+                print(f"\tExecuting action: {action_step.id}")
+                sub_goal = (obj_to_pick, obj_to_drop)
+                observations, success, goal_reached = action_step.execute(
+                    env, observations, args.n_act, sub_goal,
+                    goal_predicates.copy(), args.render,
+                )
+                tracking_data = action_step.get_tracking_data()
                 state = detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
+
+            n_ops = len(plan) / 2
             if success:
                 pick_place_success += 1
                 valid_pick_place_success += 1
-                print("+++ Object successfully picked and placed.")
-                print(f"Successfull operations: {pick_place_success}, Out of: {len(plan)/2}, Percentage advancement: {pick_place_success/(len(plan)/2)}")
+                print(f"+++ Picked and placed. {pick_place_success}/{n_ops} ({pick_place_success/n_ops:.0%})")
                 if operator == plan[-1]:
                     continue
                 try:
-                    reset_gripper(env)
+                    reset_gripper(env, detector, args.render)
                 except ValueError:
                     retry_reset = True
                     break
             else:
-                # Print the number of operators that were successfully executed out of the total number of operators in the plan
-                print("--- Object not picked and placed.")
-                print(f"Successfull operations: {pick_place_success}, Out of: {len(plan)/2}, Percentage advancement: {pick_place_success/(len(plan)/2)}")
+                print(f"--- Failed. {pick_place_success}/{n_ops} ({pick_place_success/n_ops:.0%})")
                 try:
-                    reset_gripper(env)
+                    reset_gripper(env, detector, args.render)
                 except ValueError:
                     retry_reset = True
                     break
-                continue
-            
+
+        n_ops = len(plan) / 2
         pick_place_successes.append(pick_place_success)
-        percentage_advancement.append(pick_place_success/(len(plan)/2))
-        if goal_reached or pick_place_success/(len(plan)/2) == 1.0:
+        percentage_advancement.append(pick_place_success / n_ops)
+
+        if goal_reached or pick_place_success / n_ops == 1.0:
             episode_successes += 1
-            print("Episode Execution succeeded.\n")
-        print("Success rate: ", episode_successes/(i+1))
-        print("\n\n")
+            print("Episode succeeded.")
 
-        pick_place_successes.append(pick_place_success)
-        percentage_advancement.append(pick_place_success/(len(plan)/2))
+        ep = i + 1
+        print(f"Success rate: {episode_successes / ep:.3f}")
+        print(f"Successful pick_place: {pick_place_successes}")
+        print(f"Mean successful pick_place: {mean(pick_place_successes):.2f}")
+        print(f"Mean percentage advancement: {mean(percentage_advancement):.2%}")
+        print(f"Pick-place success rate: {valid_pick_place_success / num_valid_pick_place_queries:.3f}\n")
 
-        print("Successfull pick_place: ", pick_place_successes)
-        print("Percentage advancement: ", percentage_advancement)
-        print("Mean Successful pick_place: ", mean(pick_place_successes))
-        print("Mean Percentage advancement: ", mean(percentage_advancement))
-        print("Pick placce success rate: ", valid_pick_place_success/num_valid_pick_place_queries)
-
-        print("Success rate: ", episode_successes/(i+1))
-        # Write the results to a file results_seed_{args.seed}.txt
         os.makedirs("results", exist_ok=True)
-        with open(f"results/results_neurosym_seed_{args.seed}.txt", 'w') as file:
-            file.write("Success rate: {}\n".format(episode_successes/(100)))
-            file.write("Mean Successful pick_place: {}\n".format(mean(pick_place_successes)))
-            file.write("Mean Percentage advancement: {}\n".format(mean(percentage_advancement)))
-            file.write("Pick placce success rate: {}\n".format(valid_pick_place_success/num_valid_pick_place_queries))
+        with open(f"results/results_neurosym_seed_{args.seed}.txt", "w") as f:
+            f.write(f"Success rate: {episode_successes / 100}\n")
+            f.write(f"Mean successful pick_place: {mean(pick_place_successes)}\n")
+            f.write(f"Mean percentage advancement: {mean(percentage_advancement)}\n")
+            f.write(f"Pick-place success rate: {valid_pick_place_success / num_valid_pick_place_queries}\n")
 
+    wandb.finish()
+
+
+if __name__ == "__main__":
+    main()

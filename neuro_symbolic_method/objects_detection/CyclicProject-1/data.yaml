@@ -1,0 +1,14 @@
+names:
+- cube1
+- cube2
+- cube3
+nc: 3
+roboflow:
+  license: CC BY 4.0
+  project: cyclicproject
+  url: https://universe.roboflow.com/cyclicproject/cyclicproject/dataset/1
+  version: 1
+  workspace: cyclicproject
+test: ../test/images
+train: ../train/images
+val: ../valid/images
