@@ -1,5 +1,7 @@
 # Neuro-Symbolic Method Setup
 
+WARNING: This repository is currently not up to date. An updated version will be delivered before the paper publication.
+
 This repository contains the implementation for a **neuro-symbolic
 learning framework** built on top of **MuJoCo**, **Robosuite**, and
 **Diffusion Policies**.
