@@ -26,10 +26,8 @@
     (smaller cube3 peg3)
   )
   (:goal 
-    (and
-      (on cube3 peg3)
-      (on cube2 cube3)
-      (on cube1 cube2)
-    )
+    (and (on cube3 peg3)
+         (on cube2 cube3)
+         (on cube1 cube2))
   )
 )

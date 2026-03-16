@@ -40,7 +40,7 @@ class Executor_Diffusion(Executor):
                  nulified_action_indexes=[], 
                  oracle=False, 
                  horizon=None, 
-                 use_yolo=True, 
+                 use_yolo=False, 
                  save_data=False,
                  instances_per_label=None,
                  particle_filter_particles_2d=100,
@@ -55,7 +55,7 @@ class Executor_Diffusion(Executor):
         self.model = None
         self.nulified_action_indexes = nulified_action_indexes
         self.horizon = horizon
-        self.device = torch.device("cpu")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.oracle = oracle
         self.use_yolo = use_yolo
         self.save_data = save_data
@@ -100,7 +100,7 @@ class Executor_Diffusion(Executor):
         payload = torch.load(open(path, 'rb'), pickle_module=dill)
         cfg = payload['cfg']
         cls = TrainDiffusionTransformerLowdimWorkspace
-        cfg.policy.num_inference_steps = 7
+        cfg.policy.num_inference_steps = 8
         workspace = cls(cfg)
         workspace: BaseWorkspace
         workspace.load_payload(payload, exclude_keys=None, include_keys=None)
@@ -1053,8 +1053,8 @@ class Executor_Diffusion(Executor):
 
     def get_object_obs(self, env, objects_pos, predicted_pos, obj_to_pick, place_to_drop, relative_obs=False):
         gripper_pos = objects_pos["gripper"]
-        left_finger_pos = np.asarray(env.sim.data.body_xpos[env.sim.model.body_name2id("gripper0_left_inner_finger")])
-        right_finger_pos = np.asarray(env.sim.data.body_xpos[env.sim.model.body_name2id("gripper0_right_inner_finger")])
+        left_finger_pos = np.asarray(env.sim.data.body_xpos[env.sim.model.body_name2id("gripper0_leftfinger")])
+        right_finger_pos = np.asarray(env.sim.data.body_xpos[env.sim.model.body_name2id("gripper0_rightfinger")])
         aperture = np.linalg.norm(left_finger_pos - right_finger_pos)#*1000.
 
         if len(predicted_pos) > 1:
@@ -1382,8 +1382,8 @@ class Executor_Diffusion(Executor):
                         obs = env._get_observations()
                         objects_pos = self.detector.get_all_objects_pos()
                         obs['objects_pos'] = objects_pos
-                        observations.append(obs)
-                        observations.pop(0)
+                        processed_obs.append(obs)
+                        processed_obs.pop(0)
                 else:
                     anomaly_safe = True
             #print(processed_obs)
@@ -1392,12 +1392,13 @@ class Executor_Diffusion(Executor):
             obs_dict = dict_apply(np_obs_dict, 
                 lambda x: torch.from_numpy(x).to(device=self.device))
             
+            print(processed_obs.shape)
             with torch.no_grad():
                 action_dict = self.model.predict_action(obs_dict)
             
             np_action_dict = dict_apply(action_dict,
                 lambda x: x.detach().to('cpu').numpy())
-            actions = np_action_dict['action']#/1000.0
+            actions = np_action_dict['action']
             #print("Actions: ", actions)
             
             if len(actions[0][0]) < 4:
@@ -1420,19 +1421,21 @@ class Executor_Diffusion(Executor):
                 if i_act == n_act - 1:
                     break
                 i_act += 1
-
-            
             if done:
                 self.debug_message("Environment terminated")
             
             step_executor += 1
             state = self.detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
             success = self.Beta(state, symgoal)
+            # print(state)
+            # print(self.Beta(state, symgoal))
+            # print(self.Beta({f'over(gripper,{symgoal[0]})': True}, symgoal))
+            # print()
 
             self.debug_message()
             self.debug_message("Checking goal predicates: ")
             self.debug_message(state)
-            goal_reached = True
+            goal_reached = False
             for predicate in task_goals:
                 self.debug_message("Checking predicate: ", predicate)
                 predicate_parts = predicate.split(' ')
@@ -1443,6 +1446,7 @@ class Executor_Diffusion(Executor):
                     goal_reached = False
                     break
             success = success or goal_reached
+            print(f"Step: {step_executor}, Success: {success}, Goal Reached: {goal_reached}")
             if success:
                 done = True
             if step_executor > horizon:

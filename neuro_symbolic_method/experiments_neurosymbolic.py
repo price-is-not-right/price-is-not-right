@@ -20,7 +20,7 @@ from planning.planner import (
 )
 from planning.executor import Executor_Diffusion
 from ultralytics import YOLO
-import wandb
+# import wandb
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -48,7 +48,7 @@ CONFIG_FILE_REGISTRY = {
 
 # Termination conditions registry — logic stays in Python, keyed by name
 TERMINATION_CONDITIONS = {
-    "pick":       lambda state, symgoal: state[f"picked_up({symgoal[0]})"],
+    "pick":       lambda state, symgoal: state[f"grasped({symgoal[0]})"],
     "drop":       lambda state, symgoal: state[f"on({symgoal[0]},{symgoal[1]})"] and not state[f"grasped({symgoal[0]})"],
     "reach_pick": lambda state, symgoal: state[f"over(gripper,{symgoal[0]})"],
     "reach_drop": lambda state, symgoal: state[f"over(gripper,{symgoal[1]})"],
@@ -78,6 +78,7 @@ def build_executors(cfg: dict, n_act: int, debug: bool) -> list:
     executors = []
     for spec in cfg["executors"]:
         horizon = eval(spec["horizon_formula"], {"n_act": n_act})
+        print(f"Building executor {spec['id']} with horizon {horizon}")
         executor = Executor_Diffusion(
             id=spec["id"],
             policy=policies[spec["policy_key"]],
@@ -148,17 +149,17 @@ def get_plan(state: dict, cfg: dict, detector) -> tuple:
     planning_predicates = cfg["planning_predicates"]
     pddl_path = cfg["pddl_path"]
     mode = cfg["planning_mode"]
-
     init_predicates = {
         pred: True
         for pred, val in state.items()
         if val and pred.split("(")[0] in planning_predicates and "ref" not in pred
     }
+    print(f"Initial predicates for planning: {init_predicates}")
     add_predicates_to_pddl(pddl_path, init_predicates)
 
     goal_predicates = build_goal_predicates(cfg, state, detector)
-    define_goal_in_pddl(pddl_path, goal_predicates)
-
+    if len(goal_predicates) > 0:
+        define_goal_in_pddl(pddl_path, goal_predicates)
     plan, _ = call_planner(pddl_path, mode=mode)
     return plan, goal_predicates
 
@@ -205,7 +206,7 @@ def reset_gripper(env, detector, render: bool):
         if render:
             env.render()
 
-    for _ in range(50):
+    for _ in range(5):
         env.step(np.array([0, 0, 0.5, 0]))
         if render:
             env.render()
@@ -232,20 +233,21 @@ def main():
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--size", type=int, default=256)
-    parser.add_argument("--rnd_reset", type=float, default=0.025)
+    parser.add_argument("--rnd_reset", action='store_true')
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--n_act", type=int, default=4)
+    parser.add_argument("--n_obs", type=int, default=16)
     parser.add_argument("--n_ep", type=int, default=100)
     args = parser.parse_args()
 
     np.random.seed(args.seed)
 
-    # WandB
-    wandb.init(
-        project="vlas-cycliclxm",
-        name="neurosymbolic-experiment-hs3",
-        settings=wandb.Settings(x_stats_sampling_interval=0.5),
-    )
+    # # WandB
+    # wandb.init(
+    #     project="vlas-cycliclxm",
+    #     name="neurosymbolic-experiment-hs3",
+    #     settings=wandb.Settings(x_stats_sampling_interval=0.5),
+    # )
 
     # Load config
     cfg = load_env_config(args.env)
@@ -254,14 +256,16 @@ def main():
     actions = build_executors(cfg, args.n_act, args.debug)
 
     # Load models
-    yolo_model = YOLO(cfg["yolo_model"])
-    regressor_model = joblib.load(cfg["regressor_model"])
+    # yolo_model = YOLO(cfg["yolo_model"])
+    # regressor_model = joblib.load(cfg["regressor_model"])
+    yolo_model = None
+    regressor_model = None
 
     # Build robosuite environment
     controller_config = suite.load_controller_config(default_controller="OSC_POSITION")
     env = suite.make(
         env_name=args.env,
-        robots="Kinova3",
+        robots="Panda",
         controller_configs=controller_config,
         has_renderer=args.render,
         has_offscreen_renderer=True,
@@ -273,12 +277,11 @@ def main():
         camera_names=["agentview", "robot0_eye_in_hand"],
         camera_heights=args.size,
         camera_widths=args.size,
-        cube_placement_noise=args.rnd_reset,
+        random_block_placement=args.rnd_reset,
     )
     detector = DETECTOR_REGISTRY[cfg["detector"]](env)
     env = DictObs(GymWrapper(env))
 
-    n_obs = 4
     episode_successes = 0
     num_valid_pick_place_queries = 0
     valid_pick_place_success = 0
@@ -301,12 +304,12 @@ def main():
                 env.render()
 
             observations = []
-            for _ in range(args.n_act):
+            for _ in range(args.n_obs):
                 env.step(np.zeros(env.action_space.shape))
                 obs = env._get_observations()
                 obs["objects_pos"] = detector.get_all_objects_pos()
                 observations.append(obs)
-            observations = observations[-n_obs:]
+            observations = observations[-args.n_obs:]
 
             state = detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
             plan, goal_predicates = get_plan(state, cfg, detector)
@@ -356,6 +359,7 @@ def main():
 
                 print(f"\tExecuting action: {action_step.id}")
                 sub_goal = (obj_to_pick, obj_to_drop)
+                print(len(observations))
                 observations, success, goal_reached = action_step.execute(
                     env, observations, args.n_act, sub_goal,
                     goal_predicates.copy(), args.render,
@@ -405,7 +409,7 @@ def main():
             f.write(f"Mean percentage advancement: {mean(percentage_advancement)}\n")
             f.write(f"Pick-place success rate: {valid_pick_place_success / num_valid_pick_place_queries}\n")
 
-    wandb.finish()
+    # wandb.finish()
 
 
 if __name__ == "__main__":

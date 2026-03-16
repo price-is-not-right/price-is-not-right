@@ -1,17 +1,17 @@
 env_name: Hanoi
 detector: HanoiDetector
 planning_mode: 0
-planning_predicates: [on, clear, grasped]
+planning_predicates: ['on', 'clear', 'grasped']
 
 pddl_path: planning/PDDL/hanoi/
 yolo_model: models/yolo/hanoi_yolo.pt
 regressor_model: models/regressors/hanoi_regressor.pkl
 
 policies:
-  grasp: policies/noisy_30/grasp.ckpt
-  drop: policies/noisy_30/drop.ckpt
-  reach_pick: policies/noisy_30/reach_pick.ckpt
-  reach_place: policies/noisy_30/reach_drop.ckpt
+  grasp: models/policies/extended_plus/grasp.ckpt
+  drop: models/policies/extended_plus/drop.ckpt
+  reach_pick: models/policies/extended_plus/reach_pick.ckpt
+  reach_place: models/policies/extended_plus/reach_pick.ckpt
 
 object_mapping:
   cube1: o1
@@ -27,27 +27,27 @@ executors:
     termination_condition: reach_pick
     nulified_action_indexes: [3]
     oracle: true
-    horizon_formula: "8/n_act*55"
+    horizon_formula: "(8/n_act)*130"
 
   - id: Pick
     policy_key: grasp
     termination_condition: pick
     nulified_action_indexes: [0, 1]
     oracle: true
-    horizon_formula: "8/n_act*20"
+    horizon_formula: "(8/n_act)*60"
 
   - id: ReachDrop
     policy_key: reach_place
     termination_condition: reach_drop
     nulified_action_indexes: [3]
     oracle: true
-    horizon_formula: "8/n_act*55"
+    horizon_formula: "(8/n_act)*160"
 
   - id: Drop
     policy_key: drop
     termination_condition: drop
     nulified_action_indexes: [0, 1]
     oracle: true
-    horizon_formula: "8/n_act*20"
+    horizon_formula: "(8/n_act)*60"
 
 goal_strategy: default   # use PDDL goal as-is

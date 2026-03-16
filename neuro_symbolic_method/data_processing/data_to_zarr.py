@@ -100,6 +100,24 @@ features = Features({
     'dones': Sequence(ClassLabel(names=["false", "true"]))  # Boolean done flags
 })
 
+def filter_obs(obs, action_step="main"):
+    # For testing, directly filters the observations relevant to each step
+    print(obs)
+    if action_step == "main":
+        return obs
+    elif action_step == "pick":
+        return np.concatenate([[obs[6]], [obs[3]]])
+    elif action_step == "place":
+        return np.concatenate([[obs[-1]], [obs[3]]])
+    elif action_step == "turn_on":
+        return obs[:3]
+    elif action_step == "turn_off":
+        return obs[:3]
+    elif action_step == "reach_pick":
+        return obs[4:7]
+    elif action_step == "reach_place":
+        return obs[-3:]
+
 
 def prepare_data_for_dataset(trajectories, args):
     trajectory_objects = []
@@ -107,16 +125,32 @@ def prepare_data_for_dataset(trajectories, args):
     for trajectory in trajectories:
         if not trajectory:
             continue
+        if args.lxm:
+            # If the data is in lxm format, the trajectory is a list of dictionaries with keys "obs", "acts", "next_obs", "rews", "infos"
+            obs = np.array([step["obs"] for step in trajectory])
+            acts = np.array([step["acts"] for step in trajectory])
+            keypoint = np.array([step["infos"]["symbolic_trajectory"] for step in trajectory])#
+            rews = np.array([step["rews"] for step in trajectory])
+            infos = np.array([step["infos"] for step in trajectory])
+            terminal = np.array([step["dones"] for step in trajectory])
+            traj_obj = TrajectoryWithKeypoint(obs=obs, acts=acts, infos=infos, rews=rews, terminal=terminal, keypoint=keypoint)
+            trajectory_objects.append(traj_obj)
+            continue
         episode = trajectory[0]
         # Assuming each step has observations, actions, next_obs, rewards, and done flags
-        obs = [step[0] for step in episode]
-        obs.append(episode[-1][2]) # add the `next_obs` from the last trajectory as the final obs
-        obs = np.array(obs) # turn it into np.array
-        acts = np.array([step[1] for step in episode])
-        keypoint = np.array([step[2] for step in episode])#
-        #print("obs: ", obs)
+        obs, acts = [], []
+        for step_num, step in enumerate(episode):
+            if step_num % 2 == 0: # If even step, it's an observation
+                if step_num != 0:
+                    acts.append(step)
+            else: # If odd step, it's an action
+                #obs.append(filter_obs(step, action_step=args.action_name))
+                obs.append(step)
+        obs = np.array(obs)
+        acts = np.array(acts)
+        keypoint = np.zeros((len(obs), 1)) # Placeholder keypoint, replace with actual keypoint data if available
         rews = np.zeros(len(acts))  # Assuming zero rewards for all steps
-        infos = np.array([{} for _ in episode])  # Assuming empty dicts for infos
+        infos = np.array([{} for _ in range(len(acts))])  # Empty info dictionaries
         terminal = True #episode[-1][4]  # The 'done' flag of the last step
         # print("obs shape: ", np.array(obs).shape)
         # print("acts shape: ", np.array(acts).shape)
@@ -182,10 +216,14 @@ if __name__ == "__main__":
     parser.add_argument('--num_demos', type=int, default=0, help='Number of demonstrations')
     parser.add_argument('--save_dir', type=str, default='', help='Save Directory')
     parser.add_argument('--lxm', action='store_true', help='Use lxm project format of data')
+    parser.add_argument('--action_name', type=str, default='main', help='Data Directory')
     args = parser.parse_args()
 
     # Load the buffer from the zip file
-    data_buffers = load_data_from_zip(args.data_dir + '/traces/')
+    try:
+        data_buffers = load_data_from_zip(args.data_dir + '/traces/')
+    except FileNotFoundError:
+        data_buffers = load_data_from_zip(args.data_dir)
     if args.data_dir2 != "":
         data_buffers2 = load_data_from_zip(args.data_dir2 + '/traces/')
         for act, buffer in data_buffers2.items():
