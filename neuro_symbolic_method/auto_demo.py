@@ -241,13 +241,12 @@ class RecordDemos(gym.Wrapper):
         """
         operation = operation.lower().split(' ')
         print("Operation: ", operation[0])
-        if not(args.vla):
-            if len(operation) == 3:
-                self.obj_to_pick = operation[1]
-                self.place_to_drop = operation[2]
-            elif 'turn' in operation[0]:
-                self.obj_to_pick = None
-                self.place_to_drop = None
+        if len(operation) == 3:
+            self.obj_to_pick = operation[1]
+            self.place_to_drop = operation[2]
+        elif 'turn' in operation[0]:
+            self.obj_to_pick = None
+            self.place_to_drop = None
         if 'pick' in operation[0]:
             if self.args.env == "Hanoi":
                 return self.pick, f'pick {operation[1]} from {operation[2]}', operation[1]
@@ -607,14 +606,11 @@ class RecordDemos(gym.Wrapper):
         next_obs['objects_pos'] = {k: np.asarray(v, dtype=np.float32).copy() for k, v in objects_pos.items()}
         next_obs["agentview"] = cv2.cvtColor(cv2.flip(agentview.reshape(256, 256, 3), 0), cv2.COLOR_RGB2BGR)
         next_obs["wrist_image"] = cv2.cvtColor(cv2.flip(wrist_image.reshape(256, 256, 3), 0), cv2.COLOR_RGB2BGR)
+        next_obs['proprio'] = np.asarray(full_obs["robot0_proprio-state"], dtype=np.float32).copy()
         if self.args.render:
             # display the image
             cv2.imshow('agentview', next_obs["agentview"])
-            cv2.waitKey(1)
-        if self.args.vla:
-            # Also get proprioceptive obs
-            next_obs['proprio'] = np.asarray(full_obs["robot0_proprio-state"], dtype=np.float32).copy()
-            action_step = self.task
+            cv2.waitKey(1) 
         if self.args.use_yolo:
             if len(obs) == 2:
                 obs = obs[0]
@@ -625,7 +621,7 @@ class RecordDemos(gym.Wrapper):
             cubes_predicted_xyz = self.yolo_estimate(next_obs)
             self.df_metrics = self.compute_metrics(self.df_metrics, objects_pos, cubes_predicted_xyz)
             next_obs = self.get_object_obs(objects_pos, cubes_predicted_xyz, relative_obs=True)
-        else:
+        elif self.args.object_centric:
             if len(obs) == 2:
                 obs = obs[0]
             if self.detector is None:
@@ -1154,6 +1150,8 @@ if __name__ == "__main__":
     parser.add_argument('--name', type=str, default=None, help='Name of the experiment')
     parser.add_argument('--render', action='store_true', help='Render the recording')
     parser.add_argument('--train_yolo', action='store_true', help='Store observation to train train_yolo+regressor format')
+    parser.add_argument('--object_centric', action='store_true', help='Use object centric observations, with the object at the center of the image')
+    parser.add_argument('--noise_std_factor', type=float, default=0.1, help='Standard deviation of the noise to add to the actions, as a factor of the action magnitude')
     parser.add_argument('--use_yolo', action='store_true', help='Use yolo+regressor for the object pose estimation as observation')
     parser.add_argument('--vla', action='store_true', help='Store the data in VLA friendly format')
     parser.add_argument('--size', type=int, default=256, help='Size of the observation')
@@ -1236,7 +1234,7 @@ if __name__ == "__main__":
     yolo_model = YOLO(yolo_model_paths[args.env]) if args.use_yolo or args.train_yolo else None
     yolo_id_mapping = yolo_id_mappings[args.env] if args.use_yolo or args.train_yolo else None
     regressor_model = joblib.load(regressor_model_paths[args.env]) if args.use_yolo or args.train_yolo else None
-    env = GymWrapper(env, proprio_obs=args.vla, flatten_obs=False)
+    env = GymWrapper(env, proprio_obs=True, flatten_obs=False)
     env = RecordDemos(env, 
                       detector, 
                       pddl_path, 
@@ -1246,7 +1244,8 @@ if __name__ == "__main__":
                       yolo_id_mapping=yolo_id_mapping,
                       obj_mapping=obj_mapping,
                       render=args.render, 
-                      randomize=True)
+                      randomize=True,
+                      noise_std_factor=args.noise_std_factor)
 
     os.makedirs(f'data/', exist_ok=True)
 
