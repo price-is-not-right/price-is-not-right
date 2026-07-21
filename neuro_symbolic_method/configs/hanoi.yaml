@@ -8,10 +8,10 @@ yolo_model: models/yolo/hanoi_yolo.pt
 regressor_model: models/regressors/hanoi_regressor.pkl
 
 policies:
-  grasp: diffusion_policy/data/train_gt/grasp/checkpoints/save/epoch=1300-train_loss=0.011.ckpt
-  drop: diffusion_policy/data/train_gt/drop/checkpoints/latest.ckpt
-  reach_pick: diffusion_policy/data/train_gt/reach_pick/checkpoints/epoch=2550-train_loss=0.010.ckpt
-  reach_place: diffusion_policy/data/train_gt/reach_place/checkpoints/latest.ckpt
+  grasp: models/policies/gt/grasp.ckpt
+  drop: models/policies/gt/drop.ckpt
+  reach_pick: models/policies/gt/reach_pick.ckpt
+  reach_place: models/policies/gt/reach_place.ckpt
 
 object_mapping:
   cube1: o1
@@ -27,27 +27,27 @@ executors:
     termination_condition: reach_pick
     nulified_action_indexes: [3]
     oracle: true
-    horizon_formula: "(8/n_act)*130"
+    horizon_formula: "(8/n_act)*50"
 
   - id: Pick
     policy_key: grasp
     termination_condition: pick
     nulified_action_indexes: [0, 1]
     oracle: true
-    horizon_formula: "(8/n_act)*60"
+    horizon_formula: "(8/n_act)*30"
 
   - id: ReachDrop
     policy_key: reach_place
     termination_condition: reach_drop
     nulified_action_indexes: [3]
     oracle: true
-    horizon_formula: "(8/n_act)*160"
+    horizon_formula: "(8/n_act)*50"
 
   - id: Drop
     policy_key: drop
     termination_condition: drop
     nulified_action_indexes: [0, 1]
     oracle: true
-    horizon_formula: "(8/n_act)*60"
+    horizon_formula: "(8/n_act)*30"
 
 goal_strategy: default   # use PDDL goal as-is

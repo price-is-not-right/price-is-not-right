@@ -43,7 +43,7 @@ FEATURE_COLS = TRI_COLS + BBOX_COLS + EE_COLS
 TARGET_COLS = ["world_x", "world_y", "world_z"]
 
 
-def load_data(patterns):
+def load_data(patterns, max_rows=None, dedupe=True, seed=0):
     files = []
     for pattern in patterns:
         files.extend(glob.glob(pattern, recursive=True))
@@ -56,6 +56,10 @@ def load_data(patterns):
     before = len(df)
     # Only keep rows where triangulation actually succeeded (both cameras saw the object).
     df = df.dropna(subset=FEATURE_COLS + TARGET_COLS)
+    if dedupe:
+        df = df.drop_duplicates(subset=FEATURE_COLS + TARGET_COLS)
+    if max_rows is not None and len(df) > max_rows:
+        df = df.sample(n=max_rows, random_state=seed)
     print(f"Loaded {before} rows, {len(df)} usable (both-camera + triangulated) rows, from {len(files)} files")
     return df
 
@@ -102,9 +106,11 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=0.05)
     parser.add_argument("--test_size", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--max_rows", type=int, default=200000,
+                        help="Subsample cap (GradientBoosting is slow on >1M rows)")
     args = parser.parse_args()
 
-    df = load_data(args.data_glob)
+    df = load_data(args.data_glob, max_rows=args.max_rows, seed=args.seed)
     models, metrics = train(
         df,
         n_estimators=args.n_estimators,
@@ -113,7 +119,7 @@ def main():
         test_size=args.test_size,
         seed=args.seed,
     )
-    joblib.dump({"models": models, "feature_cols": FEATURE_COLS}, args.out)
+    joblib.dump({"models": models, "feature_cols": FEATURE_COLS, "metrics": metrics}, args.out)
     print(f"Saved residual regressor to {args.out}")
 
 

@@ -1,10 +1,9 @@
-import os, argparse, time, zipfile, pickle
+import os, argparse, time, zipfile, pickle, copy
 import numpy as np
 import robosuite as suite
 import robosuite_task_zoo
 from datetime import datetime
 import gymnasium as gym
-# import gym
 import cv2
 
 from robosuite.wrappers import GymWrapper
@@ -18,10 +17,6 @@ from ultralytics import YOLO
 import joblib
 import pandas as pd
 
-# Compatibility patch for sklearn >= 1.0
-# import sklearn.ensemble._gb as _gb
-# import sys
-# sys.modules['sklearn.ensemble._gb_losses'] = _gb
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -127,11 +122,9 @@ class RecordDemos(gym.Wrapper):
                  render=False,
                  randomize=True,
                  noise_std_factor=0.1):
-        # Run super method
         super().__init__(env=env)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Set args
         self.env = env
         self.vision_based = vision_based
         self.detector = detector
@@ -144,11 +137,9 @@ class RecordDemos(gym.Wrapper):
         self.noise_std_factor = noise_std_factor
         self.obj_mapping = obj_mapping
 
-        # Set up the environment
         self.gripper_body = self.env.sim.model.body_name2id('gripper0_eef')
         self.recorded_eps = 0
 
-        # Init buffer
         self.data_buffer = dict()
         self.action_steps = []
         self.checkpoint = None
@@ -157,28 +148,42 @@ class RecordDemos(gym.Wrapper):
         self.df_metrics = pd.DataFrame(columns=['wx', 'wy', 'wz', 'pred_x', 'pred_y', 'pred_z', 'error'])
         self.bboxes_centers = []
         self.yolo_id_mapping = yolo_id_mapping
+        self.perception = None
+        if yolo_model is not None and regressor_model is not None:
+            self.perception = Executor_Diffusion(
+                id="demo_perception",
+                policy=None,
+                Beta=lambda *a, **k: False,
+                use_yolo=True,
+                oracle=True,
+                debug=False,
+            )
+            self.perception.yolo_model = yolo_model
+            self.perception.regressor_model = regressor_model
+            self.perception.detector = detector
+            self.perception.image_size = getattr(args, "size", 256)
+            self.perception.device = self.device
+            self.perception.warnings = {"obj_to_pick": True, "place_to_drop": True}
+            self.perception._skill_snapshot_pos = None
+            print("[auto_demo] Using executor vision pipeline "
+                  "(detect_cubes_simple + stereo/residual/regressor)")
         self.reset()
 
+    def reset_perception_snapshot(self):
+        if self.perception is not None:
+            self.perception.reset_tracking()
+            self.perception.warnings = {"obj_to_pick": True, "place_to_drop": True}
+
     def get_plan(self):
-        """
-        Returns the plan
-        """
-        # Detect init state
         state = self.detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
         print("Detected state: ", state)
-        # Filter and keep only the predicates that are in planning_predicates[args.env] and are True and map them to the PDDL format
         init_predicates = {predicate: True for predicate in state.keys() if state[predicate] and predicate.split("(")[0] in planning_predicates[self.args.env]}
         print("Initial predicates: ", init_predicates)
-        # Usage
-        # Remove all predicates regarding reference objects from the PDDL file
         copy_init_predicates = init_predicates.copy()
         for predicate in copy_init_predicates.keys():
             if "ref" in predicate:
                 init_predicates.pop(predicate)
         add_predicates_to_pddl(pddl_path, init_predicates)
-        # Get goal from initial state
-        # For Hanoi, KitchenEnv and NutAssembly, do nothing
-        # For CubeSorting, find all small cubes and write the goal as on(cube, target_zone)
         if self.args.env == "CubeSorting":
             goal_predicates = []
             for predicate in state.keys():
@@ -198,12 +203,10 @@ class RecordDemos(gym.Wrapper):
                 if "smaller" in predicate and state[predicate]:
                     objs = predicate[predicate.find("(")+1:predicate.find(")")].split(",")
                     sizes[objs[0]] = objs[1]
-            # Create stacking order based on sizes
             sorted_sizes = sorted(sizes.items(), key=lambda x: x[1])
             for i in range(len(sorted_sizes)-1):
                 goal_predicates.append(f'on {sorted_sizes[i][0]} {sorted_sizes[i+1][0]}')
             goal_str = "\n".join(goal_predicates)
-            # Add largest cube on platform
             goal_predicates.append(f'on {sorted_sizes[-1][0]} platform')
             print("Goal predicates: ", goal_str)
             define_goal_in_pddl(self.pddl_path, goal_predicates)
@@ -226,26 +229,16 @@ class RecordDemos(gym.Wrapper):
             define_goal_in_pddl(self.pddl_path, goal_predicates)
 
         
-        # Generate a plan
         self.plan, _ = call_planner(pddl_path, mode=planning_mode[self.args.env])
         if self.args.one_operation and len(self.plan) > 1:
-            # Keep the two first operations only
             self.plan = self.plan[:2]
         print("Task demonstrated: ", self.plan)
 
 
     def _get_lift_drop_target(self, op_idx):
-        """
-        For a PICK operation at index ``op_idx``, return the destination of its
-        matching PLACE operation (the true drop target), so the post-grasp lift
-        can be recorded relative to it. Returns ``None`` for non-pick operations
-        or when no matching place is found.
-        """
         op = self.plan[op_idx].lower().split(" ")
         if not op or "pick" not in op[0]:
             return None
-        # Plans alternate PICK <obj> <from> / PLACE <obj> <to>; the matching
-        # PLACE for this pick is the next operation acting on the same object.
         picked_obj = op[1] if len(op) > 1 else None
         for next_op in self.plan[op_idx + 1:]:
             parts = next_op.lower().split(" ")
@@ -254,10 +247,6 @@ class RecordDemos(gym.Wrapper):
         return None
 
     def operator_to_function(self, operation):
-        """
-        A function that maps the operation to the corresponding function
-        returns the function, the semantic description of the operation and the goal
-        """
         operation = operation.lower().split(' ')
         print("Operation: ", operation[0])
         if len(operation) == 3:
@@ -284,7 +273,6 @@ class RecordDemos(gym.Wrapper):
             return None
 
     def pixel_to_world_pos(self, cls_id, px1, py1, w1, h1, conf1, px2, py2, w2, h2, conf2, ee_x, ee_y, ee_z):
-        # Load linear Regression models for cube positions
         models_dual = self.regressor_model
         reg_x_dual, reg_y_dual, reg_z_dual = models_dual["reg_x"], models_dual["reg_y"], models_dual["reg_z"]
 
@@ -311,7 +299,6 @@ class RecordDemos(gym.Wrapper):
         return x, y, z
 
     def _camera_ray(self, cam_name, row_disp, col_disp, image_h, image_w):
-        """Reconstruct a world-frame ray through a pixel in the raw (unflipped) MuJoCo render frame."""
         sim = self.env.sim
         cam_id = sim.model.camera_name2id(cam_name)
         cam_pos = sim.data.cam_xpos[cam_id].copy()
@@ -328,11 +315,6 @@ class RecordDemos(gym.Wrapper):
         return cam_pos, cam_rot @ dir_cam
 
     def triangulate_dual(self, px1, py1, w1, h1, px2, py2, w2, h2, image_h=256, image_w=256):
-        """
-        Analytic stereo triangulation from agentview + wrist-camera bbox
-        centers, using the live sim's exact camera intrinsics/extrinsics.
-        Returns None if either detection is missing/degenerate.
-        """
         if w1 <= 0 or h1 <= 0 or w2 <= 0 or h2 <= 0:
             return None
         row1 = image_h - 1 - py1
@@ -349,7 +331,6 @@ class RecordDemos(gym.Wrapper):
         return (p1 + p2) / 2.0
 
     def yolo_estimate(self, obs_step):
-        # Resize the image to fit YOLO input requirements
 
         cubes_predicted_xyz = {}
         confidence_agent = {}
@@ -358,10 +339,9 @@ class RecordDemos(gym.Wrapper):
             return cubes_predicted_xyz
         agentview = obs_step["agentview"]
         wrist_image = obs_step["wrist_image"]
-        # Get the predictions
         agentview_results = self.yolo_model(agentview, verbose=False, device=self.device)[0]
         wrist_results = self.yolo_model(wrist_image, verbose=False, device=self.device)[0]
-        objects_info = obs_step["objects_pos"]  # dict with object names as keys and positions as values
+        objects_info = obs_step["objects_pos"]
         for pred in agentview_results.boxes:
             confidence_wrist = {}
             cls_id = int(pred.cls)
@@ -369,13 +349,11 @@ class RecordDemos(gym.Wrapper):
             cls = self.yolo_id_mapping[cls] if cls in self.yolo_id_mapping else cls
             x, y, w, h = pred.xywhn.tolist()[0]
             conf = pred.conf
-            # Convert normalized coordinates to pixel coordinates
             x = int(x * agentview.shape[1])
             y = int(y * agentview.shape[0])
             w = int(w * agentview.shape[1])
             h = int(h * agentview.shape[0])
 
-            # Keep only the highest confidence detection for each class
             if cls_id not in confidence_agent:
                 confidence_agent[cls_id] = conf
             else:
@@ -385,13 +363,11 @@ class RecordDemos(gym.Wrapper):
                     continue
 
             if self.args.render:
-                # Draw the bounding box on the agentview image
                 cv2.rectangle(agentview, (x - w // 2, y - h // 2), (x + w // 2, y + h // 2), (0, 255, 0), 2)
                 cv2.putText(agentview, f"{cls} {float(conf):.2f}", (x - w // 2, y - h // 2 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                 cv2.imshow('Agentview YOLO Detections', agentview)
                 cv2.waitKey(1)
 
-            # Get the ground truth position of the object
             if cls in objects_info:
                 ground_truth_xyz = objects_info[cls]
                 ee_pos = objects_info["gripper"]
@@ -407,12 +383,10 @@ class RecordDemos(gym.Wrapper):
                             confidence_wrist[cls_id2] = wrist_pred.conf
                         else:
                             continue
-                    #print("2: ", cls2)
                     if cls_id2 == cls_id:
                             found_match = True
                             x_cam2, y_cam2, w_cam2, h_cam2 = wrist_pred.xywhn.tolist()[0]
                             conf_cam2 = wrist_pred.conf
-                            # Convert normalized coordinates to pixel coordinates
                             x_cam2 = int(x_cam2 * wrist_image.shape[1])
                             y_cam2 = int(y_cam2 * wrist_image.shape[0])
                             w_cam2 = int(w_cam2 * wrist_image.shape[1])
@@ -466,22 +440,14 @@ class RecordDemos(gym.Wrapper):
                         "world_y": ground_truth_xyz[1],
                         "world_z": ground_truth_xyz[2],
                         })
-                # Use dual camera regression to estimate the position
                 predicted_xyz = self.pixel_to_world_pos(cls_id, x, y, w, h, conf, x_cam2, y_cam2, w_cam2, h_cam2, conf_cam2, ee_pos[0], ee_pos[1], ee_pos[2])
                 cubes_predicted_xyz.update({cls: predicted_xyz})
-                #print(cls)
             else:
-                # Print error message, no second image
                 print("Object detected, but no mapping to ground truth position found for class: ", cls, " in objects_info with keys: ", objects_info.keys())
-            # Print the predicted and ground truth positions
-            #print(f"Predicted: {predicted_xyz}, Ground Truth: {ground_truth_xyz}", "Error: ", np.linalg.norm(np.array(predicted_xyz) - np.array(ground_truth_xyz)))
 
         return cubes_predicted_xyz
 
     def reset(self, seed=None):
-        """
-        The reset function that resets the environment
-        """
         if self.args.checkpoints > 0:
             if self.recorded_eps // self.args.checkpoints > self.checkpoint:
                 print("\nSAVING CHECKPOINT: ", self.checkpoint)
@@ -489,7 +455,7 @@ class RecordDemos(gym.Wrapper):
                 self.action_steps = []
                 self.checkpoint += 1
         self.operator_step = 0
-        self.episode_buffer = dict() # 1 episode here consists of a trajectory between 2 symbolic nodes
+        self.episode_buffer = dict()
         self.task_buffer = list()
         self.success_reset = False
         while not self.success_reset:
@@ -518,9 +484,6 @@ class RecordDemos(gym.Wrapper):
         return obs
     
     def valid_state(self, state):
-        """
-        Checks if the state is valid for Hanoi, only 3 "on" predicates can be true at the same time, and not more than 1 cube on the same object
-        """
         on_predicates = [predicate for predicate in state.keys() if "on" in predicate and state[predicate]]
         if len(on_predicates) != 3:
             return False
@@ -534,19 +497,11 @@ class RecordDemos(gym.Wrapper):
         return True
 
     def run_trajectory(self, obs):
-        """
-        Runs the trajectory
-        """
         done = False
         for op_idx, operation in enumerate(self.plan):
-            # Look ahead to the matching PLACE operator so the post-grasp lift
-            # (recorded under the reach_place action step) can reference the
-            # true drop target instead of the object being picked from. This
-            # keeps the reach_place observations consistent between the lift and
-            # the move-to-drop sub-phases, and matches what the executor feeds
-            # the ReachDrop policy at inference time (always the drop target).
             self.lift_drop_target = self._get_lift_drop_target(op_idx)
             function, self.task, goal = self.operator_to_function(operation)
+            self.reset_perception_snapshot()
             print(f'Performing task: {self.task}, with goal: {goal}')
             done, obs = function(obs, goal)
             if not(done):
@@ -560,15 +515,11 @@ class RecordDemos(gym.Wrapper):
         return done
 
     def save_trajectory(self):
-        """
-        Saves the trajectory to the buffer
-        """
         if self.args.vla:
             episode = []
             for step in self.action_steps:
                 if step in self.episode_buffer.keys():
                     for i in range(0,len(self.episode_buffer[step]),2): 
-                        # Convert action from dx,dy,dz,gripper to dx,dy,dz,d_roll,d_pitch,d_yaw,gripper
                         action_4dim = self.episode_buffer[step][i]
                         action = np.concatenate((action_4dim[:3], np.zeros(3), action_4dim[3:]))
 
@@ -606,23 +557,32 @@ class RecordDemos(gym.Wrapper):
         print(f"YOLO data saved at {output_path}")
 
     def zip_buffer(self, dir_path):
-        # Decompose the data buffer into action steps
         for step in self.action_steps:
             if step not in self.data_buffer.keys():
                 continue
-            # Convert the data buffer to bytes
             data_bytes = pickle.dumps(self.data_buffer[step])
             if self.args.checkpoints > 0:
                 file_path = dir_path + str(self.checkpoint) + '/' + step + '.zip'
                 os.makedirs(dir_path + str(self.checkpoint), exist_ok=True)
             else:
                 file_path = dir_path + step + '.zip'
-            # Write the bytes to a zip file
             with zipfile.ZipFile(file_path, 'w') as zip_file:
                 with zip_file.open('data.pkl', 'w', force_zip64=True) as file:
                     file.write(data_bytes)
 
     def get_object_obs(self, objects_pos, predicted_pos, relative_obs=True):
+        if self.perception is not None and self.args.use_yolo:
+            self.perception.warnings.setdefault("obj_to_pick", True)
+            self.perception.warnings.setdefault("place_to_drop", True)
+            return self.perception.get_object_obs(
+                self.env,
+                objects_pos,
+                predicted_pos,
+                self.obj_to_pick,
+                self.place_to_drop,
+                relative_obs=relative_obs,
+            )
+
         gripper_pos = objects_pos["gripper"]
         left_finger_pos = np.asarray(self.env.sim.data.body_xpos[self.env.sim.model.body_name2id("gripper0_leftfinger")])
         right_finger_pos = np.asarray(self.env.sim.data.body_xpos[self.env.sim.model.body_name2id("gripper0_rightfinger")])
@@ -630,11 +590,11 @@ class RecordDemos(gym.Wrapper):
         
         try:
             obj_to_pick_pos = predicted_pos[self.obj_to_pick] if self.obj_to_pick in predicted_pos else objects_pos[self.obj_to_pick]
-        except:
+        except Exception:
             obj_to_pick_pos = np.array([0.0, 0.0, 0.0])
         try:
             place_to_drop_pos = predicted_pos[self.place_to_drop] if self.place_to_drop in predicted_pos else objects_pos[self.place_to_drop]
-        except:
+        except Exception:
             place_to_drop_pos = np.array([0.0, 0.0, 0.0])
         if relative_obs:
             rel_obj_to_pick_pos = gripper_pos - obj_to_pick_pos
@@ -645,14 +605,11 @@ class RecordDemos(gym.Wrapper):
         return obs
 
     def filter_obs(self, obs, action_step="main"):
-        #print(obs)
         if action_step == "main":
             return obs
         elif action_step == "pick":
-            #return np.concatenate([obs[3:6], [obs[-1]]])
             return np.concatenate([[obs[6]], [obs[3]]])
         elif action_step == "place":
-            #return obs[-4:]
             return np.concatenate([[obs[-1]], [obs[3]]])
         elif action_step == "turn_on":
             return obs[:3]
@@ -664,67 +621,112 @@ class RecordDemos(gym.Wrapper):
             return obs[-3:]
 
     def record_step(self, obs, action, next_obs, state_memory, next_state=None, action_step="main", goal=None, info={}):
-        """
-        Records the step
-        """
         if not(self.args.action_split):
             action_step = "main"
         full_obs = self.env.env._get_observations()
-        #print(full_obs.keys())
         objects_pos = self.detector.get_all_objects_pos()
-        agentview = np.array(full_obs["agentview_image"].reshape((self.args.size, self.args.size, 3)), dtype=np.uint8)
-        wrist_image = np.array(full_obs["robot0_eye_in_hand_image"].reshape((self.args.size, self.args.size, 3)), dtype=np.uint8)
+        agentview_raw = np.array(full_obs["agentview_image"].reshape((self.args.size, self.args.size, 3)), dtype=np.uint8)
+        wrist_raw = np.array(full_obs["robot0_eye_in_hand_image"].reshape((self.args.size, self.args.size, 3)), dtype=np.uint8)
         next_obs, obs = {}, {}
         next_obs['objects_pos'] = {k: np.asarray(v, dtype=np.float32).copy() for k, v in objects_pos.items()}
-        next_obs["agentview"] = cv2.cvtColor(cv2.flip(agentview.reshape(256, 256, 3), 0), cv2.COLOR_RGB2BGR)
-        next_obs["wrist_image"] = cv2.cvtColor(cv2.flip(wrist_image.reshape(256, 256, 3), 0), cv2.COLOR_RGB2BGR)
+        next_obs["agentview"] = cv2.cvtColor(cv2.flip(agentview_raw.reshape(self.args.size, self.args.size, 3), 0), cv2.COLOR_RGB2BGR)
+        next_obs["wrist_image"] = cv2.cvtColor(cv2.flip(wrist_raw.reshape(self.args.size, self.args.size, 3), 0), cv2.COLOR_RGB2BGR)
         next_obs['proprio'] = np.asarray(full_obs["robot0_proprio-state"], dtype=np.float32).copy()
         if self.args.render:
-            # display the image
             cv2.imshow('agentview', next_obs["agentview"])
-            cv2.waitKey(1) 
+            cv2.waitKey(1)
         if self.args.use_yolo:
-            if len(obs) == 2:
-                obs = obs[0]
-            # get all objects positions and the end effector position, store all obs within a dict
             if self.detector is None:
                 print("Detector is None")
                 return None
-            cubes_predicted_xyz = self.yolo_estimate(next_obs)
-            self.df_metrics = self.compute_metrics(self.df_metrics, objects_pos, cubes_predicted_xyz)
-            next_obs = self.get_object_obs(objects_pos, cubes_predicted_xyz, relative_obs=True)
+            if self.perception is None:
+                print("Perception pipeline is None (need YOLO + regressor)")
+                return None
+            ee_pos = objects_pos["gripper"]
+            if getattr(self.perception, "_skill_snapshot_pos", None) is None:
+                predicted_cubes_xyz, relations = self.perception.detect_cubes_simple(
+                    agentview_raw,
+                    wrist_raw,
+                    ee_pos,
+                    conf_threshold=0.8,
+                    sim=self.env.sim,
+                    render=self.args.render,
+                )
+                self.perception.relations = relations
+                self.perception.map_id_semantic = {
+                    y: p for p, y in relations.items() if y is not None
+                }
+                self.perception._skill_snapshot_pos = copy.deepcopy(predicted_cubes_xyz)
+            else:
+                predicted_cubes_xyz = copy.deepcopy(self.perception._skill_snapshot_pos or {})
+                if self.args.render and getattr(self.perception, "_last_yolo_viz", None) is not None:
+                    cv2.imshow("YOLO Detections", self.perception._last_yolo_viz)
+                    cv2.waitKey(1)
+
+            predicted_cubes_xyz = self.perception.correct_grasped_object_positions(
+                predicted_cubes_xyz,
+                ee_pos,
+                image_shape=agentview_raw.shape,
+            )
+            if self.args.train_yolo:
+                self._append_yolo_csv_from_snapshot(
+                    predicted_cubes_xyz, objects_pos, ee_pos
+                )
+            self.df_metrics = self.compute_metrics(
+                self.df_metrics, objects_pos, predicted_cubes_xyz
+            )
+            next_obs = self.get_object_obs(
+                objects_pos, predicted_cubes_xyz, relative_obs=True
+            )
         elif self.args.object_centric:
-            if len(obs) == 2:
-                obs = obs[0]
             if self.detector is None:
                 print("Detector is None")
                 return None
             next_obs = self.get_object_obs(objects_pos, {}, relative_obs=True)
+        elif self.args.train_yolo:
+            cubes_predicted_xyz = self.yolo_estimate(next_obs)
+            self.df_metrics = self.compute_metrics(
+                self.df_metrics, objects_pos, cubes_predicted_xyz
+            )
+            next_obs = self.get_object_obs(objects_pos, {}, relative_obs=True)
         if self.args.action_split:
             next_obs = self.filter_obs(next_obs, action_step)
-        # print("Recorded step for action step: ", action_step)
-        # print("Next obs shape: ", next_obs.shape if isinstance(next_obs, np.ndarray) else "dict")
-        # print('Next obs: ', next_obs)
-        # print('Action: ', action)
-        # print("\n\n")
         if action_step not in self.action_steps:
             self.action_steps.append(action_step)
         if action_step not in self.episode_buffer.keys():
-            # self.episode_buffer[action_step] = [obs, action, next_obs] # Why 3 things?
             self.episode_buffer[action_step] = [action, next_obs]
         else:
             self.episode_buffer[action_step] += [action, next_obs]
         return state_memory
 
+    def _append_yolo_csv_from_snapshot(self, predicted_pos, objects_pos, ee_pos):
+        relations = getattr(self.perception, "relations", {}) or {}
+        for pddl_id, yolo_id in relations.items():
+            if yolo_id not in predicted_pos or pddl_id not in objects_pos:
+                continue
+            pred = predicted_pos[yolo_id]
+            gt = objects_pos[pddl_id]
+            self.bboxes_centers.append({
+                "px_cam1": 0, "py_cam1": 0, "w_cam1": 0, "h_cam1": 0, "conf_cam1": 0.0,
+                "cls": yolo_id,
+                "px_cam2": 0, "py_cam2": 0, "w_cam2": 0, "h_cam2": 0, "conf_cam2": 0.0,
+                "ee_x": ee_pos[0], "ee_y": ee_pos[1], "ee_z": ee_pos[2],
+                "tri_x": pred[0], "tri_y": pred[1], "tri_z": pred[2],
+                "world_x": gt[0], "world_y": gt[1], "world_z": gt[2],
+            })
+
     def compute_metrics(self, df, objects_pos, predicted_pos):
-        """
-        Computes the metrics
-        """
-        #print([self.obj_to_pick, self.place_to_drop])
-        for obj in [self.obj_to_pick, self.place_to_drop]:
-            if obj in predicted_pos and obj in objects_pos:
-                #print('TRUE')
-                predicted_pos_obj = predicted_pos[obj]
+        relations = {}
+        if self.perception is not None:
+            relations = getattr(self.perception, "relations", {}) or {}
+
+        targets = [self.obj_to_pick, self.place_to_drop]
+        for obj in targets:
+            if obj is None:
+                continue
+            pred_key = relations.get(obj, obj)
+            if pred_key in predicted_pos and obj in objects_pos:
+                predicted_pos_obj = predicted_pos[pred_key]
                 world_pos_obj = objects_pos[obj]
                 df = pd.concat(
                     [
@@ -747,41 +749,25 @@ class RecordDemos(gym.Wrapper):
         return df
 
     def cap(self, eps, max_val=0.12, min_val=0.01):
-        """
-        Caps the displacement
-        """
-        # If the displacement is greater than the max value, cap it
         if np.linalg.norm(eps) > max_val:
             eps = eps / np.linalg.norm(eps) * max_val
-        # If the displacement is smaller than the min value, cap it
         if np.linalg.norm(eps) < min_val:
             eps = eps / np.linalg.norm(eps) * min_val
         return eps
 
     def to_osc_pose(self, action):
-        """
-        Converts the action to the OSC pose
-        """
-        # Add [0, 0, 0] to the action to make it a 6D action and the gripper aperture at the end
-        # Insert [0, 0, 0] from action[3] to action[5]
         if not self.args.ee:
             action = np.insert(action, 3, [0, 0, 0])
         return action
 
     def pick(self, obs, goal):
-        """
-        Transitons the environment to a state where the gripper is has picked the object
-        """
         state = self.detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
         self.state_memory = state
-        #print("\n\n\t\t---------------------PICK GOAL IS: ", goal)
-        #print("\n\n")
         reset_step_count = 0
 
         goal_str = goal
         goal = self.env.sim.model.body_name2id(self.detector.object_id[goal_str])
 
-        # Moving gripper 10 cm above the object
         ref_z = 1.1
         z_pos = 0
         while z_pos < ref_z:
@@ -804,7 +790,6 @@ class RecordDemos(gym.Wrapper):
         reset_step_count = 0
         self.env.time_step = 0
 
-        #print("Moving gripper over object...")
         gripper_goal = "pot_handle" if goal_str == "pot" else goal_str
     
         while not state['over(gripper,{})'.format(gripper_goal)]:
@@ -832,7 +817,6 @@ class RecordDemos(gym.Wrapper):
         reset_step_count = 0
         self.env.time_step = 0
 
-        #print("Opening gripper...")
         while not state['open_gripper(gripper)']:
             action = np.asarray([0,0,0,-1])
             action = self.to_osc_pose(action)
@@ -849,7 +833,6 @@ class RecordDemos(gym.Wrapper):
         reset_step_count = 0
         self.env.time_step = 0
 
-        #print("Moving down gripper to grab level...")
         while not state['at_grab_level(gripper,{})'.format(goal_str)]:
             gripper_pos = np.asarray(self.env.sim.data.body_xpos[self.gripper_body])
             object_pos = np.asarray(self.env.sim.data.body_xpos[goal])
@@ -870,7 +853,6 @@ class RecordDemos(gym.Wrapper):
         reset_step_count = 0
         self.env.time_step = 0
 
-        #print("Closing gripper...")
         while not state['grasped({})'.format(goal_str)]:
             action = np.asarray([0,0,0,1])
             action = self.to_osc_pose(action)
@@ -887,14 +869,6 @@ class RecordDemos(gym.Wrapper):
         reset_step_count = 0
         self.env.time_step = 0
 
-        #print("Lifting object...")
-        # The lift is recorded under the reach_place action step, so its
-        # observations must reference the same target the ReachDrop policy sees
-        # at inference: the actual drop location. During a PICK the default
-        # self.place_to_drop is the object being picked *from* (directly below
-        # the gripper), which taught the policy to only lift when xy offset ~= 0
-        # and made it translate instead of lifting at execution. Point the
-        # place reference at the true drop target for the duration of the lift.
         original_place_to_drop = self.place_to_drop
         if getattr(self, "lift_drop_target", None) is not None:
             self.place_to_drop = self.lift_drop_target
@@ -921,13 +895,8 @@ class RecordDemos(gym.Wrapper):
         return True, obs
 
     def place(self, obs, goal):
-        """
-        Transitons the environment to a state where the gripper is object is placed at the place to drop
-        """
         state = self.detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
         self.state_memory = state
-        #print("\n\n\t\t---------------------PICK GOAL IS: ", goal)
-        #print("\n\n")
         reset_step_count = 0
 
         goal_str = goal[1]
@@ -945,32 +914,22 @@ class RecordDemos(gym.Wrapper):
 
         print("Moving gripper over place to drop...")
         while not state['over(gripper,{})'.format(goal_str)]:
-            #distance = self.detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=True)['over(gripper,stove)']
-            #print("Distance: ", distance)
             if pick_str == 'pot':
                 gripper_pos = self.env.sim.data.body_xpos[self.env.sim.model.body_name2id("PotObject_root")]
             elif self.args.env == "NutAssembly":
                 if goal_str == "roundpeg":
-                    gripper_pos = np.asarray(self.env.sim.data.body_xpos[pick_body]) +np.array([0, -0.01, 0]) #+np.array([0, -0.05, 0])
+                    gripper_pos = np.asarray(self.env.sim.data.body_xpos[pick_body]) +np.array([0, -0.01, 0])
                 elif goal_str == "squarepeg":
-                    gripper_pos = np.asarray(self.env.sim.data.body_xpos[pick_body]) +np.array([+0.015, +0.01, 0])#+ np.array([0.01, -0.025, 0])
+                    gripper_pos = np.asarray(self.env.sim.data.body_xpos[pick_body]) +np.array([+0.015, +0.01, 0])
             else:
                 gripper_pos = np.asarray(self.env.sim.data.body_xpos[self.gripper_body])
             if 'peg' in goal_str and self.args.env == "Hanoi":
                 object_pos = self.detector.area_pos[goal_str]
             elif "serving" in goal_str:
                 object_pos = np.asarray(self.env.sim.data.body_xpos[goal])+np.array([0.002, -0.05, 0])
-            # elif self.args.env == "NutAssembly" and goal_str == "roundpeg":
-            #     object_pos = np.asarray(self.env.sim.data.body_xpos[goal])+np.array([0, 0.05, 0])
-            # elif self.args.env == "NutAssembly" and goal_str == "squarepeg":
-            #     object_pos = np.asarray(self.env.sim.data.body_xpos[goal])+ np.array([-0.01, 0.025, 0])
-            #elif "stove" in goal_str:
-            #    object_pos = np.asarray(self.env.sim.data.body_xpos[goal])+np.array([0.01, 0, 0])
-            #elif "pot" in goal_str:
-            #    object_pos = np.asarray(self.env.sim.data.body_xpos[goal])+np.array([0, -0.01, 0])
             else:
                 object_pos = np.asarray(self.env.sim.data.body_xpos[goal])
-            dist_xy_plan = object_pos[:2] - gripper_pos[:2] #+ 0.05
+            dist_xy_plan = object_pos[:2] - gripper_pos[:2]
             dist_xy_plan = self.cap(dist_xy_plan)
             action = 5*np.concatenate([dist_xy_plan, [0, 0]]) if not(self.randomize) else 5*np.concatenate([dist_xy_plan, [0, 0]]) + np.concatenate([np.random.normal(0, self.noise_std_factor*np.linalg.norm(dist_xy_plan), 3), [0]])
             action = self.to_osc_pose(action)
@@ -990,11 +949,9 @@ class RecordDemos(gym.Wrapper):
         print("Moving down picked object on place to drop...")
         while not state['on({},{})'.format(pick_str, goal_str)]:
             gripper_pos = np.asarray(self.env.sim.data.body_xpos[self.gripper_body])
-            #object_pos = np.asarray(self.env.sim.data.body_xpos[goal])
             place_pos = np.asarray(self.env.sim.data.body_xpos[goal])
             dist_z_axis = [- (gripper_pos[2] - place_pos[2])]
             dist_z_axis = self.cap(dist_z_axis)
-            #print("Distance to place: ", dist_z_axis, dist_xy_plan)
             action = 5*np.concatenate([[0, 0], dist_z_axis, [0]]) if not(self.randomize) else 5*np.concatenate([[0, 0], dist_z_axis, [0]]) + np.concatenate([[0, 0], np.random.normal(0, self.noise_std_factor*np.linalg.norm(dist_z_axis), 1), [0]])
             action = self.to_osc_pose(action)
             next_obs, _, _, _, info  = self.env.step(action)
@@ -1011,7 +968,7 @@ class RecordDemos(gym.Wrapper):
         self.env.time_step = 0
 
         print("dropping object...")
-        while not(state['open_gripper(gripper)']):#state['grasped({})'.format(goal_str)]:
+        while not(state['open_gripper(gripper)']):
             action = np.asarray([0,0,0,-1])
             action = self.to_osc_pose(action)
             next_obs, _, _, _, info  = self.env.step(action)
@@ -1027,8 +984,6 @@ class RecordDemos(gym.Wrapper):
         reset_step_count = 0
         self.env.time_step = 0
 
-        #print("Resetting gripper")
-        # First move up
         for _ in range(15):
             action = np.array([0, 0, 1, 0])
             action = self.to_osc_pose(action)
@@ -1044,13 +999,8 @@ class RecordDemos(gym.Wrapper):
         return True, obs
     
     def turn_on_button(self, obs, goal):
-        """
-        Transitons the environment to a state where button is turned on
-        """
         state = self.detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
         self.state_memory = state
-        #print("\n\n\t\t---------------------PICK GOAL IS: ", goal)
-        #print("\n\n")
 
         goal_str = goal
         goal = self.env.sim.model.body_name2id(self.detector.object_id[goal_str])
@@ -1061,7 +1011,6 @@ class RecordDemos(gym.Wrapper):
 
         reset_step_count = 0
 
-        #print("Moving gripper over button...")
         while not state['over(gripper,{})'.format(goal_str)]:
             gripper_pos = np.asarray(self.env.sim.data.body_xpos[self.gripper_body])
             object_pos = np.asarray(self.env.sim.data.body_xpos[goal])
@@ -1082,7 +1031,6 @@ class RecordDemos(gym.Wrapper):
         reset_step_count = 0
         self.env.time_step = 0
 
-        #print("Moving down gripper to swith level ...")
         while not state['at_grab_level(gripper,{})'.format(goal_str)]:
             gripper_pos = np.asarray(self.env.sim.data.body_xpos[self.gripper_body])
             object_pos = np.asarray(self.env.sim.data.body_xpos[goal])
@@ -1103,7 +1051,6 @@ class RecordDemos(gym.Wrapper):
         reset_step_count = 0
         self.env.time_step = 0
 
-        #print("Turning on button...")
         while not state['stove_on()']:
             action = np.asarray([0,0.3,0,0])
             action = self.to_osc_pose(action)
@@ -1135,13 +1082,8 @@ class RecordDemos(gym.Wrapper):
         return True, obs
     
     def turn_off_button(self, obs, goal):
-        """
-        Transitons the environment to a state where button is turned off
-        """
         state = self.detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
         self.state_memory = state
-        #print("\n\n\t\t---------------------PICK GOAL IS: ", goal)
-        #print("\n\n")
 
         goal_str = goal
         goal = self.env.sim.model.body_name2id(self.detector.object_id[goal_str])
@@ -1152,7 +1094,6 @@ class RecordDemos(gym.Wrapper):
 
         reset_step_count = 0
 
-        #print("Moving gripper over button...")
         while not state['over(gripper,{})'.format(goal_str)]:
             gripper_pos = np.asarray(self.env.sim.data.body_xpos[self.gripper_body])
             object_pos = np.asarray(self.env.sim.data.body_xpos[goal])
@@ -1173,7 +1114,6 @@ class RecordDemos(gym.Wrapper):
         reset_step_count = 0
         self.env.time_step = 0
 
-        #print("Moving down gripper to swith level ...")
         while not state['at_grab_level(gripper,{})'.format(goal_str)]:
             gripper_pos = np.asarray(self.env.sim.data.body_xpos[self.gripper_body])
             object_pos = np.asarray(self.env.sim.data.body_xpos[goal])
@@ -1194,7 +1134,6 @@ class RecordDemos(gym.Wrapper):
         reset_step_count = 0
         self.env.time_step = 0
 
-        #print("Turning off button...")
         while state['stove_on()']:
             action = np.asarray([0,-0.3,0,0])
             action = self.to_osc_pose(action)
@@ -1226,7 +1165,6 @@ class RecordDemos(gym.Wrapper):
         return True, obs
 
 if __name__ == "__main__":
-    # Define the command line arguments
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', type=str, default='Hanoi', choices=['Hanoi', 'KitchenEnv', 'NutAssembly', 'CubeSorting', 'AssemblyLineSorting', 'HeightStacking', 'PatternReplication'], help='Name of the environment to run the experiment in')
     parser.add_argument('--dir', type=str, default='./data/', help='Path to the data folder')
@@ -1237,7 +1175,7 @@ if __name__ == "__main__":
     parser.add_argument('--train_yolo', action='store_true', help='Store observation to train train_yolo+regressor format')
     parser.add_argument('--object_centric', action='store_true', help='Use object centric observations, with the object at the center of the image')
     parser.add_argument('--noise_std_factor', type=float, default=0.1, help='Standard deviation of the noise to add to the actions, as a factor of the action magnitude')
-    parser.add_argument('--use_yolo', action='store_true', help='Use yolo+regressor for the object pose estimation as observation')
+    parser.add_argument('--use_yolo', action='store_true', help='Use executor vision pipeline (detect_cubes_simple + stereo/residual/regressor) for object pose observations')
     parser.add_argument('--vla', action='store_true', help='Store the data in VLA friendly format')
     parser.add_argument('--size', type=int, default=256, help='Size of the observation')
     parser.add_argument('--checkpoints', type=int, default=0, help='Saves the data every n episodes, and resets the buffer')
@@ -1248,19 +1186,16 @@ if __name__ == "__main__":
 
 
     args = parser.parse_args()
-    # Set the random seed
     np.random.seed(args.seed)
-    # Define the directories
     dir = args.dir
     experiment_name = args.env + '_seed_' + str(args.seed)
-    experiment_id = f"{to_datestring(time.time())}"#self.hashid 
+    experiment_id = f"{to_datestring(time.time())}"
     if args.name is not None:
         experiment_id = args.name
     args.env_dir = os.path.join(dir, experiment_name, experiment_id)
 
     print("Starting experiment {}.".format(os.path.join(experiment_name, experiment_id)))
 
-    # Create the directories
     args.traces = args.env_dir + '/traces/'
     args.yolo_data = args.env_dir + '/yolo_data/'
     os.makedirs(args.env_dir, exist_ok=True)
@@ -1270,12 +1205,10 @@ if __name__ == "__main__":
 
     obj_mapping = env_pddl_mapping[args.env]
 
-    # Load the controller config
     if not args.ee:
         controller_config = suite.load_controller_config(default_controller='OSC_POSE')
     else:
         controller_config = suite.load_controller_config(default_controller='OSC_POSITION')
-    # Create the environment
     if args.env == 'Hanoi':
         env = suite.make(
             args.env,
@@ -1291,7 +1224,6 @@ if __name__ == "__main__":
             camera_widths=args.size,
             random_block_placement=args.rnd_reset,
             cube_init_pos_noise_std=0.025,
-            #random_block_selection=args.rnd_reset,
             peg_xy_jitter=0.025,
         )
     else:
@@ -1313,7 +1245,6 @@ if __name__ == "__main__":
 
     env.reset()
 
-    # Wrap the environment
     detector = env_detectors[args.env](env)
     pddl_path = pddl_paths[args.env]
     yolo_model = YOLO(yolo_model_paths[args.env]) if args.use_yolo or args.train_yolo else None
@@ -1334,7 +1265,6 @@ if __name__ == "__main__":
 
     os.makedirs(f'data/', exist_ok=True)
 
-    # Run the recording of the demonstrations
     episode = 1
     while env.recorded_eps < args.episodes: 
         obs = env.reset()
@@ -1346,7 +1276,6 @@ if __name__ == "__main__":
         print("Number of recorded episodes: {}".format(env.recorded_eps))
         if args.use_yolo:
             print("Metric df: \n", env.df_metrics.describe())
-            # Compute the error metrics
             mean_error_x = env.df_metrics["diff_x"].mean()
             mean_error_y = env.df_metrics["diff_y"].mean()
             mean_error_z = env.df_metrics["diff_z"].mean()

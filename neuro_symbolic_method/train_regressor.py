@@ -88,16 +88,6 @@ def train(df, max_iter=400, max_depth=8, learning_rate=0.05, test_size=0.1, seed
         models[axis] = model
 
     # Joint 3D error on held-out split (same indices via re-split with seed)
-    X_train, X_test, _, _ = train_test_split(
-        X, df[TARGET_COLS[0]].values, test_size=test_size, random_state=seed
-    )
-    y_test = df.loc[
-        df.index.isin(
-            train_test_split(df.index, test_size=test_size, random_state=seed)[1]
-        ),
-        TARGET_COLS,
-    ].astype(np.float64).values
-    # Simpler joint eval:
     _, X_te, yx_tr, yx_te = train_test_split(
         X, df["world_x"].values, test_size=test_size, random_state=seed
     )
@@ -160,7 +150,8 @@ def main():
         seed=args.seed,
     )
     joblib.dump({"reg_x": models["reg_x"], "reg_y": models["reg_y"], "reg_z": models["reg_z"],
-                 "metrics": metrics, "feature_cols": FEATURE_COLS}, args.out)
+                 "metrics": metrics, "feature_cols": FEATURE_COLS},
+                args.out)
     print(f"Saved versioned regressor to {args.out}")
 
     if args.active:

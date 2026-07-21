@@ -20,7 +20,6 @@ from planning.planner import (
 )
 from planning.executor import Executor_Diffusion
 from ultralytics import YOLO
-# import wandb
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -46,7 +45,6 @@ CONFIG_FILE_REGISTRY = {
     "PatternReplication": "configs/patternreplication.yaml",
 }
 
-# Termination conditions registry — logic stays in Python, keyed by name
 TERMINATION_CONDITIONS = {
     "pick":       lambda state, symgoal: state[f"grasped({symgoal[0]})"],
     "drop":       lambda state, symgoal: state[f"on({symgoal[0]},{symgoal[1]})"] and not state[f"grasped({symgoal[0]})"],
@@ -74,14 +72,6 @@ def load_env_config(env_name: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def resolve_policies(cfg: dict, use_yolo: bool) -> dict:
-    """
-    Keep GT-trained policy checkpoints by default.
-
-    YOLO-trained grasp policies performed *worse* for mid-air closing when
-    perception is already accurate (triangulation+residual): they close ~3cm
-    above the cube. GT policies + accurate relative z are the right pairing;
-    `use_yolo` only switches the position *source*, not the policy weights.
-    """
     return dict(cfg["policies"])
 
 
@@ -90,10 +80,6 @@ def build_executors(cfg: dict, n_act: int, debug: bool, use_yolo: bool = False) 
     executors = []
     for spec in cfg["executors"]:
         horizon = eval(spec["horizon_formula"], {"n_act": n_act})
-        # `oracle` controls the observation *format* the policy consumes
-        # (relative, per-skill sliced) and is independent of the position
-        # source. `use_yolo` toggles whether positions come from perception or
-        # sim ground truth.
         print(f"Building executor {spec['id']} with horizon {horizon} "
               f"(oracle={spec['oracle']}, use_yolo={use_yolo})")
         executor = Executor_Diffusion(
@@ -215,29 +201,42 @@ class DictObs(gym.Env):
 # Gripper reset
 # ---------------------------------------------------------------------------
 
-def reset_gripper(env, detector, render: bool):
+def reset_gripper(env, detector, render: bool, max_open_steps: int = 80, max_home_steps: int = 200):
     print("Resetting gripper")
     state = detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
-    while not state["open_gripper(gripper)"]:
-        env.step(np.array([0, 0, 0, -1]))
+
+    for step_i in range(max_open_steps):
+        if state.get("open_gripper(gripper)", False):
+            break
+        env.step(np.array([0.0, 0.0, 0.35, -1.0]))
         state = detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
         if render:
             env.render()
+    else:
+        ap = detector.open("gripper", return_distance=True)
+        print(f"[reset_gripper] open timeout after {max_open_steps} steps "
+              f"(aperture={ap}); continuing")
 
-    for _ in range(5):
-        env.step(np.array([0, 0, 0.5, 0]))
+    for _ in range(10):
+        env.step(np.array([0.0, 0.0, 0.5, -1.0]))
         if render:
             env.render()
 
-    gripper_pos = env._get_observations()["robot0_eef_pos"]
-    delta = RESET_GRIPPER_POS - gripper_pos
-    while np.linalg.norm(delta) > 0.01:
-        action = 5 * np.array([delta[0], delta[1], delta[2], 0]) * 0.9
-        env.step(action)
-        if render:
-            env.render()
-        gripper_pos = env._get_observations()["robot0_eef_pos"]
+    gripper_pos = np.asarray(env._get_observations()["robot0_eef_pos"], dtype=float)
+    for step_i in range(max_home_steps):
         delta = RESET_GRIPPER_POS - gripper_pos
+        dist = float(np.linalg.norm(delta))
+        if dist <= 0.01:
+            break
+        action = np.clip(4.0 * delta, -1.0, 1.0)
+        env.step(np.array([action[0], action[1], action[2], -1.0]))
+        if render:
+            env.render()
+        gripper_pos = np.asarray(env._get_observations()["robot0_eef_pos"], dtype=float)
+    else:
+        dist = float(np.linalg.norm(RESET_GRIPPER_POS - gripper_pos))
+        print(f"[reset_gripper] home timeout after {max_home_steps} steps "
+              f"(dist={dist:.4f}m); continuing")
 
 
 # ---------------------------------------------------------------------------
@@ -262,20 +261,11 @@ def main():
 
     np.random.seed(args.seed)
 
-    # # WandB
-    # wandb.init(
-    #     project="vlas-cycliclxm",
-    #     name="neurosymbolic-experiment-hs3",
-    #     settings=wandb.Settings(x_stats_sampling_interval=0.5),
-    # )
 
-    # Load config
     cfg = load_env_config(args.env)
 
-    # Build executors
     actions = build_executors(cfg, args.n_act, args.debug, use_yolo=args.use_yolo)
 
-    # Load perception models only when running with YOLO
     if args.use_yolo:
         print(f"Loading YOLO model: {cfg['yolo_model']}")
         yolo_model = YOLO(cfg["yolo_model"])
@@ -285,7 +275,6 @@ def main():
         yolo_model = None
         regressor_model = None
 
-    # Build robosuite environment
     controller_config = suite.load_controller_config(default_controller="OSC_POSITION")
     env = suite.make(
         env_name=args.env,
@@ -321,7 +310,6 @@ def main():
         goal_reached = False
         np.random.seed(args.seed + i)
 
-        # Reset until a valid plan is found
         while plan is False:
             env.reset()
             if args.render:
@@ -344,11 +332,9 @@ def main():
         pick_place_success = 0
         n_ops = len(plan) / 2
         skip_next_place = False
-        # Shared YOLO snapshot: cleared/refreshed only just after each gripper reset.
         perception_tracking = {}
 
         def reset_gripper_and_perception():
-            """Move home, then clear YOLO so the next action takes one fresh snapshot."""
             nonlocal perception_tracking
             reset_gripper(env, detector, args.render)
             if args.use_yolo and actions:
@@ -367,8 +353,8 @@ def main():
                 if len(parts) < 3:
                     raise ValueError(f"Malformed PICK operator: {operator}")
                 obj_to_pick = parts[1].lower()
-                obj_to_drop = parts[2].lower()  # source support (unused by Pick obs slice)
-                skill = actions[:2]  # ReachPick, Pick
+                obj_to_drop = parts[2].lower()
+                skill = actions[:2]
                 sub_goal = (obj_to_pick, obj_to_drop)
                 print(f"Picking: {obj_to_pick}")
             elif op_name == "place":
@@ -380,7 +366,7 @@ def main():
                     raise ValueError(f"Malformed PLACE operator: {operator}")
                 obj_to_pick = parts[1].lower()
                 obj_to_drop = parts[2].lower()
-                skill = actions[2:4]  # ReachDrop, Drop
+                skill = actions[2:4]
                 sub_goal = (obj_to_pick, obj_to_drop)
                 num_valid_pick_place_queries += 1
                 print(f"Placing: {obj_to_pick} on {obj_to_drop}")
@@ -409,12 +395,14 @@ def main():
                 if perception_tracking:
                     action_step.set_tracking_data(perception_tracking)
 
-                print(f"\tExecuting action: {action_step.id}")
-                print(len(observations))
+                if args.debug:
+                    print(f"\tExecuting action: {action_step.id}")
+                    print(len(observations))
                 observations, success, goal_reached = action_step.execute(
                     env, observations, args.n_act, sub_goal,
                     goal_predicates.copy(), args.render,
                 )
+                print(f"\t{action_step.id}: {'Success' if success else 'Failed'}")
                 if args.use_yolo:
                     perception_tracking = action_step.get_tracking_data()
                 state = detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
@@ -456,20 +444,23 @@ def main():
             print("Episode succeeded.")
 
         ep = i + 1
+        pick_place_rate = (
+            valid_pick_place_success / num_valid_pick_place_queries
+            if num_valid_pick_place_queries > 0
+            else 0.0
+        )
         print(f"Success rate: {episode_successes / ep:.3f}")
         print(f"Successful pick_place: {pick_place_successes}")
         print(f"Mean successful pick_place: {mean(pick_place_successes):.2f}")
         print(f"Mean percentage advancement: {mean(percentage_advancement):.2%}")
-        print(f"Pick-place success rate: {valid_pick_place_success / num_valid_pick_place_queries:.3f}\n")
+        print(f"Pick-place success rate: {pick_place_rate:.3f}\n")
 
         os.makedirs("results", exist_ok=True)
         with open(f"results/results_neurosym_seed_{args.seed}.txt", "w") as f:
             f.write(f"Success rate: {episode_successes / 100}\n")
             f.write(f"Mean successful pick_place: {mean(pick_place_successes)}\n")
             f.write(f"Mean percentage advancement: {mean(percentage_advancement)}\n")
-            f.write(f"Pick-place success rate: {valid_pick_place_success / num_valid_pick_place_queries}\n")
-
-    # wandb.finish()
+            f.write(f"Pick-place success rate: {pick_place_rate}\n")
 
 
 if __name__ == "__main__":
