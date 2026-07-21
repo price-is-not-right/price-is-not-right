@@ -31,6 +31,9 @@ neuro_symbolic_method/Metric-FF-v2.1.tgz
 neuro_symbolic_method/smoke_loc*.out
 neuro_symbolic_method/models/regressors/archive/
 neuro_symbolic_method/models/regressors/*.pkl.bak
-neuro_symbolic_method/models/policies/
+# Ignore local policy folders, but track LFS-backed gt checkpoints
+neuro_symbolic_method/models/policies/*
+!neuro_symbolic_method/models/policies/gt/
+!neuro_symbolic_method/models/policies/gt/**
 *:Zone.Identifier
 **/*:Zone.Identifier
