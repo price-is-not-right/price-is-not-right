@@ -1,42 +1,23 @@
 import zarr
-import numcodecs
-import zipfile, pickle, copy, json, argparse, os
+import zipfile, pickle, json, argparse, os
 import numpy as np
-from datasets import Dataset, Features, Value, ClassLabel, Sequence
-from imitation.data.types import TrajectoryWithRew
 import dataclasses
 
+
 @dataclasses.dataclass(frozen=True, eq=False)
-class TrajectoryWithKeypoint(TrajectoryWithRew):
-    """A `Trajectory` that additionally includes reward information."""
+class TrajectoryWithKeypoint:
+    """A lightweight trajectory container used for zarr conversion.
 
+    Holds the arrays needed to build the diffusion-policy dataset without
+    depending on the heavy `imitation`/`datasets` libraries.
+    """
+
+    obs: np.ndarray
+    acts: np.ndarray
+    infos: np.ndarray
+    rews: np.ndarray
+    terminal: bool
     keypoint: np.ndarray
-    """Reward, shape (trajectory_len, ). dtype float."""
-
-    def __post_init__(self):
-        """Performs input validation, including for rews."""
-        super().__post_init__()
-
-
-class GoalTrajectory(TrajectoryWithRew):
-    """A `Trajectory` that additionally includes reward information."""
-
-    desired_goals: np.ndarray
-
-    achieved_goals: np.ndarray
-
-    def __post_init__(self):
-        """Performs input validation, including for rews."""
-        super().__post_init__()
-
-class KeypointTrajectory(TrajectoryWithRew):
-    """A `Trajectory` that additionally includes reward information."""
-
-    keypoint: np.ndarray
-
-    def __post_init__(self):
-        """Performs input validation, including for rews."""
-        super().__post_init__()
 
 
 def load_data_from_zip(dir_path):
@@ -91,14 +72,6 @@ def convert_to_dict_format(data_buffer):
 
 
 
-
-features = Features({
-    'observations': Sequence(Value('float32')),  # Assuming observations are vectors of floats
-    'actions': Sequence(Value('float32')),  # Assuming actions are vectors of floats
-    'next_observations': Sequence(Value('float32')),  # Same as observations
-    'rewards': Sequence(Value('float32')),  # Rewards are floats
-    'dones': Sequence(ClassLabel(names=["false", "true"]))  # Boolean done flags
-})
 
 def filter_obs(obs, action_step="main"):
     # For testing, directly filters the observations relevant to each step

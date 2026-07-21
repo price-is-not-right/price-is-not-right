@@ -7,6 +7,7 @@
 '''
 import os
 import dill
+import joblib
 import torch
 import numpy as np
 from diffusion_policy.common.pytorch_util import dict_apply
@@ -124,27 +125,301 @@ class Executor_Diffusion(Executor):
 
 
 
-    def pixel_to_world_dual(self, cls_id, px1, py1, w1, h1, conf1, px2, py2, w2, h2, conf2, ee_x, ee_y, ee_z):
-        models_dual = self.regressor_model
-        reg_x_dual, reg_y_dual, reg_z_dual = models_dual["reg_x"], models_dual["reg_y"], models_dual["reg_z"]
+    def _load_residual_regressor(self):
+        """
+        Lazily load the learned residual-correction model that refines the
+        analytic triangulation estimate to sub-millimeter accuracy. Returns
+        None (triangulation used as-is) if the model file isn't present.
+        """
+        import os
+        candidates = [
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "models", "regressors", "hanoi_residual_regressor.pkl"),
+            "models/regressors/hanoi_residual_regressor.pkl",
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                try:
+                    payload = joblib.load(path)
+                    self.debug_message(f"Loaded residual regressor from {path}")
+                    return payload
+                except Exception as e:
+                    self.debug_message(f"Failed to load residual regressor from {path}: {e}")
+        self.debug_message("No residual regressor found; using raw triangulation.")
+        return None
 
-        try:
-            features = np.array([[float(cls_id),
-                                float(px1), float(py1), float(w1), float(h1), float(conf1),
-                                float(px2), float(py2), float(w2), float(h2), float(conf2),
-                                float(ee_x), float(ee_y), float(ee_z)]], dtype=np.float64)
-            x = reg_x_dual.predict(features)[0]
-            y = reg_y_dual.predict(features)[0]
-            z = reg_z_dual.predict(features)[0]
-        except:
-            features = np.array([[
-                      float(px1), float(py1), float(w1), float(h1), float(conf1),
-                      float(px2), float(py2), float(w2), float(h2), float(conf2),
-                      float(ee_x), float(ee_y), float(ee_z)]], dtype=np.float64)
-            x = reg_x_dual.predict(features)[0] + 0.03 # small bias correction
-            y = reg_y_dual.predict(features)[0]
-            z = reg_z_dual.predict(features)[0]
-        return x, y, z
+    def _camera_ray(self, sim, cam_name, row_disp, col_disp, image_h, image_w):
+        """
+        Reconstruct a world-frame ray (origin, unit direction) through a pixel
+        in the *unflipped* (raw MuJoCo render) image frame, using the exact
+        MuJoCo camera intrinsics/extrinsics. `row_disp`/`col_disp` are pixel
+        coordinates in that raw frame (row 0 = top as rendered by MuJoCo,
+        before any vertical flip is applied for display/YOLO).
+        """
+        cam_id = sim.model.camera_name2id(cam_name)
+        cam_pos = sim.data.cam_xpos[cam_id].copy()
+        cam_rot = sim.data.cam_xmat[cam_id].reshape(3, 3).copy()
+        fovy = sim.model.cam_fovy[cam_id]
+        f = 0.5 * image_h / np.tan(fovy * np.pi / 360)
+
+        # Invert of: u = f*x_c/zf + W/2 ; v = -f*y_c/zf + H/2 ; row = H-1-v
+        v = image_h - 1 - row_disp
+        u = col_disp
+        x_c = u - image_w / 2.0
+        y_c = -(v - image_h / 2.0)
+        z_c = -f
+        dir_cam = np.array([x_c, y_c, z_c], dtype=np.float64)
+        dir_cam /= np.linalg.norm(dir_cam)
+        dir_world = cam_rot @ dir_cam
+        return cam_pos, dir_world
+
+    @staticmethod
+    def _triangulate_rays(o1, d1, o2, d2, max_gap=0.04):
+        """Least-squares closest point between two (nearly-)intersecting 3D rays."""
+        A = np.stack([d1, -d2], axis=1)  # 3x2
+        ATA = A.T @ A
+        # Guard against near-parallel rays (degenerate baseline).
+        if np.linalg.det(ATA) < 1e-12:
+            return None
+        ts = np.linalg.solve(ATA, A.T @ (o2 - o1))
+        # Both rays must look forward toward the scene.
+        if ts[0] <= 0.05 or ts[1] <= 0.05:
+            return None
+        p1 = o1 + ts[0] * d1
+        p2 = o2 + ts[1] * d2
+        if np.linalg.norm(p1 - p2) > max_gap:
+            return None
+        return (p1 + p2) / 2.0
+
+    @staticmethod
+    def _in_hanoi_workspace(xyz):
+        """Soft prior on where cubes live (covers peg1/2/3 stack volumes)."""
+        x, y, z = float(xyz[0]), float(xyz[1]), float(xyz[2])
+        return abs(x) < 0.18 and -0.28 <= y <= 0.30 and 0.80 <= z <= 0.96
+
+    # Known cube half-extents (MuJoCo box geoms) for single-view size→depth.
+    CUBE_HALF_SIZE = {
+        "blue cube": 0.02,
+        "red cube": 0.0225,
+        "green cube": 0.025,
+    }
+
+    def _single_view_size_depth(self, sim, cam_name, px, py, w, h, half_size, image_h, image_w):
+        """Pinhole depth from known cube side length and bbox size, then unproject."""
+        if w <= 0 or h <= 0 or half_size <= 0:
+            return None
+        cam_id = sim.model.camera_name2id(cam_name)
+        cam_pos = sim.data.cam_xpos[cam_id].copy()
+        cam_rot = sim.data.cam_xmat[cam_id].reshape(3, 3).copy()
+        fovy = sim.model.cam_fovy[cam_id]
+        f = 0.5 * image_h / np.tan(fovy * np.pi / 360.0)
+        side = 2.0 * float(half_size)
+        pix = max(0.5 * (float(w) + float(h)), 1.0)
+        depth = f * side / pix  # along camera optical axis
+        # Pixel in flipped YOLO frame → raw MuJoCo row
+        row_disp = image_h - 1 - py
+        v = image_h - 1 - row_disp
+        u = px
+        x_c = (u - image_w / 2.0) * (depth / f)
+        y_c = -((v - image_h / 2.0) * (depth / f))
+        z_c = -depth
+        p_cam = np.array([x_c, y_c, z_c], dtype=np.float64)
+        return cam_pos + cam_rot @ p_cam
+
+    def pixel_to_world_dual(self, cls_id, px1, py1, w1, h1, conf1, px2, py2, w2, h2, conf2, ee_x, ee_y, ee_z,
+                             sim=None, image_h=256, image_w=256, cls_name=None):
+        """
+        Dual-camera bbox (+ optional EE) → world XYZ.
+
+        Priority:
+          1) Stereo triangulation (+ residual) when both cameras see the object
+          2) Single-view size→depth for clean agentview boxes (unoccluded cubes)
+          3) Learned dual-camera+EE regressor
+        """
+        cam1_valid = w1 > 0 and h1 > 0
+        cam2_valid = w2 > 0 and h2 > 0
+
+        # 1) Dual-camera analytic triangulation
+        if sim is not None and cam1_valid and cam2_valid:
+            row1 = image_h - 1 - py1
+            row2 = image_h - 1 - py2
+            o1, d1 = self._camera_ray(sim, "agentview", row1, px1, image_h, image_w)
+            o2, d2 = self._camera_ray(sim, "robot0_eye_in_hand", row2, px2, image_h, image_w)
+            est = self._triangulate_rays(o1, d1, o2, d2)
+            if est is not None and self._in_hanoi_workspace(est):
+                if not hasattr(self, "residual_regressor"):
+                    self.residual_regressor = self._load_residual_regressor()
+                resid = self.residual_regressor
+                if resid is not None:
+                    feats = np.array([[
+                        float(est[0]), float(est[1]), float(est[2]),
+                        float(px1), float(py1), float(w1), float(h1), float(conf1),
+                        float(px2), float(py2), float(w2), float(h2), float(conf2),
+                        float(ee_x), float(ee_y), float(ee_z)]], dtype=np.float64)
+                    m = resid["models"] if "models" in resid else resid
+                    est = np.array([
+                        est[0] + m["res_x"].predict(feats)[0],
+                        est[1] + m["res_y"].predict(feats)[0],
+                        est[2] + m["res_z"].predict(feats)[0],
+                    ], dtype=np.float64)
+                # Fuse size→depth Z when the agentview box looks clean and XY agrees.
+                # Stereo XY is usually strong; Z often has a ~1cm low bias at home pose.
+                if cls_name is not None:
+                    half = self.CUBE_HALF_SIZE.get(cls_name)
+                    if half is not None:
+                        aspect = max(float(w1), float(h1)) / max(min(float(w1), float(h1)), 1.0)
+                        area = float(w1) * float(h1)
+                        if aspect <= 1.30 and area >= 400.0:
+                            p = self._single_view_size_depth(
+                                sim, "agentview", px1, py1, w1, h1, half, image_h, image_w)
+                            if (p is not None and self._in_hanoi_workspace(p)
+                                    and np.hypot(p[0] - est[0], p[1] - est[1]) < 0.03):
+                                est = np.array([est[0], est[1], 0.5 * (est[2] + float(p[2]))],
+                                               dtype=np.float64)
+                if self._in_hanoi_workspace(est):
+                    return float(est[0]), float(est[1]), float(est[2])
+
+        # 2) Size→depth from agentview when stereo is unavailable/rejected.
+        #    Prefer this over the regressor for single-view: the dual-cam regressor
+        #    systematically collapses Y toward peg1/peg2 when the wrist view is empty
+        #    (cube-on-peg3 error was ~10cm). Workspace check rejects bad occlusions.
+        # 2) Learned dual-camera + EE regressor (primary single-view path).
+        #    Retrained model is accurate on peg3; size→depth often overestimates
+        #    depth for stacked/partial boxes and must not override it.
+        reg_est = None
+        if self.regressor_model is not None:
+            models_dual = self.regressor_model
+            if isinstance(models_dual, dict) and "models" in models_dual and "reg_x" not in models_dual:
+                models_dual = models_dual["models"]
+            reg_x_dual, reg_y_dual, reg_z_dual = models_dual["reg_x"], models_dual["reg_y"], models_dual["reg_z"]
+            n_features = getattr(reg_x_dual, 'n_features_in_', 13)
+            if n_features == 14:
+                features = np.array([[float(cls_id),
+                                    float(px1), float(py1), float(w1), float(h1), float(conf1),
+                                    float(px2), float(py2), float(w2), float(h2), float(conf2),
+                                    float(ee_x), float(ee_y), float(ee_z)]], dtype=np.float64)
+            else:
+                features = np.array([[
+                          float(px1), float(py1), float(w1), float(h1), float(conf1),
+                          float(px2), float(py2), float(w2), float(h2), float(conf2),
+                          float(ee_x), float(ee_y), float(ee_z)]], dtype=np.float64)
+            reg_est = (
+                float(reg_x_dual.predict(features)[0]),
+                float(reg_y_dual.predict(features)[0]),
+                float(reg_z_dual.predict(features)[0]),
+            )
+            if self._in_hanoi_workspace(reg_est):
+                return reg_est
+
+        # 3) Size→depth fallback (strict): only if regressor missing/out-of-workspace.
+        if sim is not None and cls_name is not None and cam1_valid:
+            half = self.CUBE_HALF_SIZE.get(cls_name)
+            if half is not None:
+                aspect = max(float(w1), float(h1)) / max(min(float(w1), float(h1)), 1.0)
+                area = float(w1) * float(h1)
+                if aspect <= 1.25 and area >= 400.0:
+                    p = self._single_view_size_depth(
+                        sim, "agentview", px1, py1, w1, h1, half, image_h, image_w)
+                    if p is not None:
+                        # Stricter than general workspace: stacked bboxes bias depth high.
+                        ok = (abs(float(p[0])) < 0.08 and -0.28 <= float(p[1]) <= 0.30
+                              and 0.80 <= float(p[2]) <= 0.92)
+                        self.debug_message(
+                            f"  [SIZE-DEPTH] {cls_name} aspect={aspect:.2f} area={area:.0f} "
+                            f"xyz={np.round(p, 4)} ok={ok} cam2={cam2_valid}"
+                        )
+                        if ok:
+                            return float(p[0]), float(p[1]), float(p[2])
+
+        if reg_est is not None:
+            return reg_est
+
+        return float(ee_x), float(ee_y), float(ee_z)
+
+    def detect_cubes_simple(self, image1, image2, ee_pos, conf_threshold=0.8, sim=None, render=False):
+        """
+        Single-frame color-mapped detection (no multi-object tracking).
+
+        For each YOLO color class, keep the highest-confidence agentview box,
+        match the same class in the wrist view, regress 3D, and map color→PDDL.
+        Returns (predicted_pos keyed by 'color_0', relations pddl→yolo_id).
+        """
+        image1 = cv2.cvtColor(cv2.flip(cv2.resize(image1, (256, 256)), 0), cv2.COLOR_RGB2BGR)
+        image2 = cv2.cvtColor(cv2.flip(cv2.resize(image2, (256, 256)), 0), cv2.COLOR_RGB2BGR)
+        pred1 = self.yolo_model.predict(image1, verbose=False, device=self.device)[0]
+        pred2 = self.yolo_model.predict(image2, verbose=False, device=self.device)[0]
+
+        best_cam1 = {}  # cls_name -> (conf, cls_id, x, y, w, h)
+        for box in pred1.boxes:
+            conf = float(box.conf)
+            if conf < conf_threshold:
+                continue
+            cls_id = int(box.cls)
+            cls = self.yolo_model.names[cls_id]
+            x, y, w, h = box.xywhn.tolist()[0]
+            x, y = int(x * image1.shape[1]), int(y * image1.shape[0])
+            w, h = int(w * image1.shape[1]), int(h * image1.shape[0])
+            if cls not in best_cam1 or conf > best_cam1[cls][0]:
+                best_cam1[cls] = (conf, cls_id, x, y, w, h)
+
+        # Wrist cam often has lower conf at home pose; accept weaker matches
+        # only for classes already confirmed in agentview (enables stereo).
+        # Keep a floor so random low-conf wrist boxes don't poison triangulation.
+        wrist_conf_threshold = min(conf_threshold, 0.25)
+        best_cam2 = {}
+        for box in pred2.boxes:
+            conf = float(box.conf)
+            if conf < wrist_conf_threshold:
+                continue
+            cls_id = int(box.cls)
+            cls = self.yolo_model.names[cls_id]
+            if cls not in best_cam1:
+                continue
+            x, y, w, h = box.xywhn.tolist()[0]
+            x, y = int(x * image2.shape[1]), int(y * image2.shape[0])
+            w, h = int(w * image2.shape[1]), int(h * image2.shape[0])
+            if cls not in best_cam2 or conf > best_cam2[cls][0]:
+                best_cam2[cls] = (conf, cls_id, x, y, w, h)
+
+        predicted_pos = {}
+        relations = {}
+        viz = image1.copy() if render else None
+        for cls, (conf1, cls_id, x1, y1, w1, h1) in best_cam1.items():
+            pddl_id = self.HANOI_COLOR_TO_PDDL.get(cls)
+            if pddl_id is None:
+                continue
+            if cls in best_cam2:
+                conf2, _, x2, y2, w2, h2 = best_cam2[cls]
+            else:
+                conf2, x2, y2, w2, h2 = 0.0, 0, 0, 0, 0
+            xyz = self.pixel_to_world_dual(
+                cls_id, x1, y1, w1, h1, conf1,
+                x2, y2, w2, h2, conf2,
+                ee_pos[0], ee_pos[1], ee_pos[2],
+                sim=sim, image_h=image1.shape[0], image_w=image1.shape[1],
+                cls_name=cls,
+            )
+            yolo_id = f"{cls}_0"
+            predicted_pos[yolo_id] = xyz
+            relations[pddl_id] = yolo_id
+            self.debug_message(
+                f"  [SIMPLE DET] {pddl_id} <- {yolo_id} "
+                f"xyz={np.round(xyz, 4)} conf1={conf1:.2f} conf2={conf2:.2f}"
+            )
+            if viz is not None:
+                x1i, y1i = int(x1 - w1 / 2), int(y1 - h1 / 2)
+                x2i, y2i = int(x1 + w1 / 2), int(y1 + h1 / 2)
+                cv2.rectangle(viz, (x1i, y1i), (x2i, y2i), (0, 255, 0), 2)
+                label = f"{pddl_id}:{conf1:.2f}"
+                cv2.putText(viz, label, (x1i, max(12, y1i - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+
+        if viz is not None:
+            self._last_yolo_viz = viz
+            cv2.imshow("YOLO Detections", viz)
+            cv2.waitKey(1)
+
+        return predicted_pos, relations
 
     def compute_iou(self, box1, box2):
         """Compute IoU between two bounding boxes [x_center, y_center, w, h]"""
@@ -502,7 +777,23 @@ class Executor_Diffusion(Executor):
         
         for det_idx, track_idx in zip(det_indices, track_indices):
             score = -cost_matrix[det_idx, track_idx]
-            if score >= iou_threshold:
+            matched = score >= iou_threshold
+            if not matched:
+                # IoU-only matching fails when an object's bbox has moved a
+                # lot since the track last had a *real* detection (e.g. after
+                # being placed down elsewhere), which otherwise spawns a new
+                # track every frame while the old (now frozen) one lingers
+                # forever because it's still referenced in self.relations.
+                # Fall back to 3D-position proximity so the same physical
+                # object keeps its stable track ID.
+                tracked_id = tracked_ids[track_idx]
+                det_pos = det.get('position')
+                track_pos = self.tracked_objects[tracked_id].get('position')
+                if det_pos is not None and track_pos is not None:
+                    dist_3d = np.linalg.norm(np.array(det_pos) - np.array(track_pos))
+                    if dist_3d < 0.08:  # 8cm proximity fallback
+                        matched = True
+            if matched:
                 tracked_id = tracked_ids[track_idx]
                 
                 # Additional outlier check
@@ -584,7 +875,7 @@ class Executor_Diffusion(Executor):
             'bbox_center_2d': bbox_2d
         }
 
-    def yolo_estimate(self, image1, image2, save_video=False, cubes_obs=None, ee_pos=None, conf_threshold=0.7, max_missing_frames=10, render=False):
+    def yolo_estimate(self, image1, image2, save_video=False, cubes_obs=None, ee_pos=None, conf_threshold=0.7, max_missing_frames=10, render=False, sim=None):
         """
         Enhanced YOLO estimation with particle filter tracking and noise removal.
         """
@@ -664,7 +955,9 @@ class Executor_Diffusion(Executor):
             predicted_xyz = self.pixel_to_world_dual(
                 cls_id, x, y, w, h, conf,
                 x_cam2, y_cam2, w_cam2, h_cam2, conf_cam2,
-                ee_pos[0], ee_pos[1], ee_pos[2]
+                ee_pos[0], ee_pos[1], ee_pos[2],
+                sim=sim, image_h=image1.shape[0], image_w=image1.shape[1],
+                cls_name=cls,
             )
             
             detections_by_class[cls].append({
@@ -933,6 +1226,7 @@ class Executor_Diffusion(Executor):
                     pass
 
         # STEP 7: Periodically clean noisy tracks
+        self.count += 1
         if self.count % 10 == 0:  # Clean every 10 frames
             self.clean_noisy_tracks(min_detection_frames=5, max_unmatched_ratio=0.7)
 
@@ -978,13 +1272,57 @@ class Executor_Diffusion(Executor):
         pd.DataFrame(self.bboxes_centers).to_csv(output_path, index=False)
         self.debug_message(f"YOLO data saved at {output_path}")
 
+    def get_last_known_position(self, semantic_id):
+        """Get last known position for a semantic object from tracking state."""
+        yolo_id = self.relations.get(semantic_id)
+        if yolo_id is not None:
+            metadata = getattr(self, 'tracking_metadata', {}).get(yolo_id, {})
+            if metadata.get('last_position') is not None:
+                return np.asarray(metadata['last_position'])
+            tracked = self.tracked_objects.get(yolo_id, {})
+            if tracked.get('position') is not None:
+                return np.asarray(tracked['position'])
+
+        if hasattr(self, 'last_known_semantic_positions'):
+            if semantic_id in self.last_known_semantic_positions:
+                return self.last_known_semantic_positions[semantic_id]
+
+        return None
+
+    def resolve_object_position(self, semantic_id, predicted_pos, yolo_id=None):
+        """Resolve object position from YOLO prediction or last known tracking data."""
+        if yolo_id is None:
+            yolo_id = self.relations.get(semantic_id)
+
+        if yolo_id is not None and yolo_id in predicted_pos:
+            pos = np.asarray(predicted_pos[yolo_id])
+        else:
+            pos = self.get_last_known_position(semantic_id)
+            if pos is not None and yolo_id is not None and yolo_id not in predicted_pos:
+                self.debug_message(
+                    f"Warning: Mapped YOLO ID {yolo_id} for {semantic_id} not in predicted positions. "
+                    "Using last known position."
+                )
+
+        if pos is not None:
+            if not hasattr(self, 'last_known_semantic_positions'):
+                self.last_known_semantic_positions = {}
+            self.last_known_semantic_positions[semantic_id] = pos
+
+        return pos
+
     def reset_tracking(self):
-        """Reset all tracking data. Call this at the start of a new episode."""
+        """Reset all tracking / mapping state. Call at the start of each skill."""
         self.tracked_objects = {}
         self.tracking_metadata = {}
         self.next_object_id = {}
         self.instances_per_label = {}
         self.detection_outlier_count = {}
+        self.last_known_semantic_positions = {}
+        self.relations = {}
+        self.map_id_semantic = {}
+        self._skill_snapshot_pos = None
+        self.count = 0
         self.debug_message("Tracking data reset")
     
     def set_tracking_data(self, tracking_data_dict):
@@ -994,6 +1332,11 @@ class Executor_Diffusion(Executor):
         self.instances_per_label = tracking_data_dict.get('instances_per_label', {})
         self.detection_outlier_count = tracking_data_dict.get('detection_outlier_count', {})
         self.next_object_id = tracking_data_dict.get('next_object_id', {})
+        self.relations = tracking_data_dict.get('relations', {})
+        self.map_id_semantic = tracking_data_dict.get('map_id_semantic', {})
+        self.last_known_semantic_positions = tracking_data_dict.get(
+            'last_known_semantic_positions', {})
+        self._skill_snapshot_pos = tracking_data_dict.get('_skill_snapshot_pos', None)
 
     def get_tracking_data(self):
         """Returns all the variables related to tracking for external use."""
@@ -1005,7 +1348,11 @@ class Executor_Diffusion(Executor):
             'instances_per_label': self.instances_per_label,
             'detection_outlier_count': self.detection_outlier_count,
             'next_object_id': self.next_object_id,
-            'instances_per_label': self.instances_per_label
+            'relations': getattr(self, 'relations', {}),
+            'map_id_semantic': getattr(self, 'map_id_semantic', {}),
+            'last_known_semantic_positions': getattr(
+                self, 'last_known_semantic_positions', {}),
+            '_skill_snapshot_pos': getattr(self, '_skill_snapshot_pos', None),
         }
 
     def action_obs_mapping(self, obs, action_step="PickPlace", relative=False):
@@ -1026,7 +1373,7 @@ class Executor_Diffusion(Executor):
             if relative:
                 oracle = np.concatenate([obs[index_obs["obj_to_pick_z"][0]:index_obs["obj_to_pick_z"][1]] - obs[index_obs["gripper_z"][0]:index_obs["gripper_z"][1]], obs[index_obs["aperture"][0]:index_obs["aperture"][1]]])
             else:
-                oracle = np.concatenate([obs[index_obs["obj_to_pick_z"][0]:index_obs["obj_to_pick_z"][1]] + 0.01, obs[index_obs["aperture"][0]:index_obs["aperture"][1]]])
+                oracle = np.concatenate([obs[index_obs["obj_to_pick_z"][0]:index_obs["obj_to_pick_z"][1]], obs[index_obs["aperture"][0]:index_obs["aperture"][1]]])
         elif action_step == "ReachDrop":
             if relative:
                 oracle = np.concatenate([obs[index_obs["place_to_drop_pos"][0]:index_obs["place_to_drop_pos"][1]] - obs[index_obs["gripper_pos"][0]:index_obs["gripper_pos"][1]]])
@@ -1057,45 +1404,57 @@ class Executor_Diffusion(Executor):
         right_finger_pos = np.asarray(env.sim.data.body_xpos[env.sim.model.body_name2id("gripper0_rightfinger")])
         aperture = np.linalg.norm(left_finger_pos - right_finger_pos)#*1000.
 
-        if len(predicted_pos) > 1:
+        obj_to_pick_yolo_id = self.relations.get(obj_to_pick, None)
+        place_to_drop_yolo_id = self.relations.get(place_to_drop, None)
 
-            # Get relationships between predicted objects
-            predicted_objs = [SceneObject(id=obj_id, position=predicted_pos[obj_id]) for obj_id in predicted_pos.keys()]
-            update_object_metadata(predicted_objs, eps=1e-3)
-            # Query example:
-            # a = objs[0]
-            # b = objs[1]
+        if obj_to_pick_yolo_id is None and self.warnings["obj_to_pick"]:
+            self.debug_message(f"Warning: No YOLO prediction matched for object to pick: {obj_to_pick}")
+            self.warnings["obj_to_pick"] = False  # Only warn once per episode
+        if place_to_drop_yolo_id is None and self.warnings["place_to_drop"]:
+            self.debug_message(f"Warning: No YOLO prediction matched for place to drop: {place_to_drop}")
+            self.warnings["place_to_drop"] = False  # Only warn once per episode
 
-            # Get relationships between sim objects
-            cubes_only = {obj_id: pos for obj_id, pos in objects_pos.items() if obj_id != "gripper" and 'cube' in obj_id}
-            sim_objs = [SceneObject(id=obj_id, position=cubes_only[obj_id]) for obj_id in cubes_only.keys()]
-            update_object_metadata(sim_objs, eps=1e-3)
+        obj_to_pick_pos = self.resolve_object_position(obj_to_pick, predicted_pos, obj_to_pick_yolo_id)
+        place_to_drop_pos = self.resolve_object_position(place_to_drop, predicted_pos, place_to_drop_yolo_id)
 
-            obj_to_pick_yolo_id = self.relations.get(obj_to_pick, None)
-            place_to_drop_yolo_id = self.relations.get(place_to_drop, None)
+        # Fall back to sim positions only for static fixtures YOLO cannot label
+        # (pegs). Never inject GT for movable cubes — that would be vision cheating.
+        def _static_fixture(name):
+            return name is not None and str(name).startswith("peg")
 
-            # if None, self.debug_message warning
-            if obj_to_pick_yolo_id is None and self.warnings["obj_to_pick"]:
-                self.debug_message(f"Warning: No YOLO prediction matched for object to pick: {obj_to_pick}")
-                self.warnings["obj_to_pick"] = False  # Only warn once per episode
-            if place_to_drop_yolo_id is None and self.warnings["place_to_drop"]:
-                self.debug_message(f"Warning: No YOLO prediction matched for place to drop: {place_to_drop}")
-                self.warnings["place_to_drop"] = False  # Only warn once per episode
-
-            if obj_to_pick_yolo_id is not None and obj_to_pick_yolo_id not in predicted_pos:
-                self.debug_message(f"Warning: Mapped YOLO ID {obj_to_pick_yolo_id} for object to pick not in predicted positions. Using tracked positions if available.")
-                obj_to_pick_pos = self.tracking_metadata.get(obj_to_pick_yolo_id, {}).get('last_position', objects_pos[obj_to_pick])
+        if obj_to_pick_pos is None:
+            if _static_fixture(obj_to_pick) and obj_to_pick in objects_pos:
+                obj_to_pick_pos = np.asarray(objects_pos[obj_to_pick])
             else:
-                obj_to_pick_pos = predicted_pos[obj_to_pick_yolo_id] if obj_to_pick_yolo_id is not None else objects_pos[obj_to_pick]
-            
-            if place_to_drop_yolo_id is not None and place_to_drop_yolo_id not in predicted_pos:
-                self.debug_message(f"Warning: Mapped YOLO ID {place_to_drop_yolo_id} for place to drop not in predicted positions. Using tracked positions if available.")
-                place_to_drop_pos = self.tracking_metadata.get(place_to_drop_yolo_id, {}).get('last_position', objects_pos[place_to_drop])
+                obj_to_pick_pos = np.asarray(gripper_pos, dtype=np.float64)
+                self.debug_message(
+                    f"  [POS] missing detection for pick target {obj_to_pick}; using gripper pos"
+                )
+        if place_to_drop_pos is None:
+            if _static_fixture(place_to_drop) and place_to_drop in objects_pos:
+                place_to_drop_pos = np.asarray(objects_pos[place_to_drop])
+            elif place_to_drop in objects_pos and not str(place_to_drop).startswith("cube"):
+                place_to_drop_pos = np.asarray(objects_pos[place_to_drop])
             else:
-                place_to_drop_pos = predicted_pos[place_to_drop_yolo_id] if place_to_drop_yolo_id is not None else objects_pos[place_to_drop]
-        else:
-            obj_to_pick_pos = objects_pos[obj_to_pick]
-            place_to_drop_pos = objects_pos[place_to_drop]
+                place_to_drop_pos = np.asarray(gripper_pos, dtype=np.float64)
+                self.debug_message(
+                    f"  [POS] missing detection for place target {place_to_drop}; using gripper pos"
+                )
+
+        if self.use_yolo:
+            gt_pick = np.asarray(objects_pos.get(obj_to_pick))
+            gt_drop = np.asarray(objects_pos.get(place_to_drop))
+            self.debug_message(
+                f"  [POS DEBUG] {obj_to_pick}: yolo_id={obj_to_pick_yolo_id} "
+                f"pred={np.round(obj_to_pick_pos, 4)} gt={np.round(gt_pick, 4)} "
+                f"err={np.round(np.asarray(obj_to_pick_pos) - gt_pick, 4)}"
+            )
+            self.debug_message(
+                f"  [POS DEBUG] {place_to_drop}: yolo_id={place_to_drop_yolo_id} "
+                f"pred={np.round(place_to_drop_pos, 4)} gt={np.round(gt_drop, 4)} "
+                f"err={np.round(np.asarray(place_to_drop_pos) - gt_drop, 4)}"
+            )
+            self.debug_message(f"  [POS DEBUG] gripper={np.round(np.asarray(gripper_pos), 4)}")
 
         if relative_obs:
             rel_obj_to_pick_pos = gripper_pos - obj_to_pick_pos
@@ -1106,49 +1465,74 @@ class Executor_Diffusion(Executor):
         return obs
 
     def map_gripper(self, action):
+        # Binarize the gripper command to match the discrete open/close actions
+        # used during data collection (auto_demo issues +1 to close, -1 to open).
+        # Previously this clamped to +/-0.1, which only applied ~10% of the close
+        # command and prevented the gripper from fully closing on small cubes.
         action_gripper = action[-1]
         if -0.5 < action_gripper < 0.5:
             action_gripper = np.array([0])
-        if action_gripper <= -0.5:
-            action_gripper = np.array([-0.1])
+        elif action_gripper <= -0.5:
+            action_gripper = np.array([-1.0])
         elif action_gripper >= 0.5:
-            action_gripper = np.array([0.1])
+            action_gripper = np.array([1.0])
         action = np.concatenate([action[:3], action_gripper])
         return action
     
+    # Fixed color→PDDL map for Hanoi (YOLO class names are the cube identity).
+    HANOI_COLOR_TO_PDDL = {
+        "blue cube": "cube1",
+        "red cube": "cube2",
+        "green cube": "cube3",
+    }
+
     def build_object_relations(self, predicted_pos, objects_pos):
         """
         Build relations mapping between YOLO detections and PDDL semantic IDs.
-        
-        Args:
-            predicted_pos: Dict of YOLO track IDs -> 3D positions
-            objects_pos: Dict of PDDL semantic IDs -> 3D positions from sim
-        
-        Returns:
-            relations dict: PDDL semantic ID -> YOLO track ID
+
+        Prefer YOLO color class → PDDL cube ID when available (Hanoi cubes have
+        fixed colors). Relational matching alone is unstable after a move and
+        was remapping e.g. cube2→blue, causing the arm to reach the blue cube
+        twice in a row.
         """
-        # Get relationships between predicted objects
-        predicted_objs = [SceneObject(id=obj_id, position=predicted_pos[obj_id]) 
-                        for obj_id in predicted_pos.keys()]
-        update_object_metadata(predicted_objs, eps=1e-3)
-        
-        # Get relationships between sim objects
-        cubes_only = {obj_id: pos for obj_id, pos in objects_pos.items() 
-                    if obj_id != "gripper" and 'cube' in obj_id}
-        sim_objs = [SceneObject(id=obj_id, position=cubes_only[obj_id]) 
-                    for obj_id in cubes_only.keys()]
-        update_object_metadata(sim_objs, eps=1e-3)
-        
-        # Map predicted positions to object positions based on relationships
-        relations = match_objects_by_relationships(sim_objs, predicted_objs)
-        
-        self.debug_message("\n=== Detected-to-PDDL Mapping (based on relational similarity) ===")
-        for pddl_id, yolo_id in relations.items():
+        relations = {}
+        # Color-based assignment first (one track per color class).
+        for yolo_id in predicted_pos.keys():
+            cls = yolo_id.rsplit("_", 1)[0]  # 'blue cube_0' -> 'blue cube'
+            pddl_id = self.HANOI_COLOR_TO_PDDL.get(cls)
+            if pddl_id is None:
+                continue
+            # Keep highest-confidence / first track per color if duplicates.
+            if pddl_id not in relations:
+                relations[pddl_id] = yolo_id
+
+        # Fall back to relational matching only for cubes still unmapped.
+        cubes_only = {obj_id: pos for obj_id, pos in objects_pos.items()
+                      if obj_id != "gripper" and "cube" in obj_id}
+        unmapped_pddl = [cid for cid in cubes_only if cid not in relations]
+        if unmapped_pddl:
+            predicted_objs = [SceneObject(id=obj_id, position=predicted_pos[obj_id])
+                              for obj_id in predicted_pos.keys()]
+            update_object_metadata(predicted_objs, eps=1e-3)
+            sim_objs = [SceneObject(id=obj_id, position=cubes_only[obj_id])
+                        for obj_id in cubes_only.keys()]
+            update_object_metadata(sim_objs, eps=1e-3)
+            rel_match = match_objects_by_relationships(sim_objs, predicted_objs)
+            used_yolo = set(relations.values())
+            for pddl_id in unmapped_pddl:
+                yolo_id = rel_match.get(pddl_id)
+                if yolo_id and yolo_id not in used_yolo:
+                    relations[pddl_id] = yolo_id
+                    used_yolo.add(yolo_id)
+
+        self.debug_message("\n=== Detected-to-PDDL Mapping (color-first) ===")
+        for pddl_id in sorted(cubes_only.keys()):
+            yolo_id = relations.get(pddl_id)
             if yolo_id:
                 self.debug_message(f"{pddl_id}  -->  {yolo_id}")
             else:
                 self.debug_message(f"{pddl_id}  -->  (no confident match found)")
-        
+
         return relations
     
     def update_relations_with_new_detections(self, new_predicted_pos, objects_pos):
@@ -1188,6 +1572,30 @@ class Executor_Diffusion(Executor):
                 # Keep stable mappings where YOLO ID still exists
                 for pddl_id, yolo_id in self.relations.items():
                     if yolo_id in current_yolo_ids:
+                        # A track that hasn't received a real detection in a
+                        # while (high missing_frames) is just coasting on its
+                        # last known position, so old_pos == new_pos trivially
+                        # and this check would otherwise "stabilize" onto a
+                        # frozen/stale track forever, overriding a correct
+                        # remap onto the track that's actually being detected.
+                        missing_frames = self.tracking_metadata.get(yolo_id, {}).get('missing_frames', 0)
+                        if missing_frames >= 5:
+                            continue
+                        # If build_object_relations already re-assigned this
+                        # PDDL object to a *different* freshly-detected track,
+                        # trust that remap instead of re-asserting the old ID.
+                        # Otherwise we'd desync self.relations (says new track)
+                        # from self.map_id_semantic and leave a stale duplicate
+                        # ghost track (e.g. green cube_8 vs green cube_14) mapped
+                        # to the same physical cube.
+                        freshly_mapped = new_relations.get(pddl_id)
+                        if freshly_mapped is not None and freshly_mapped != yolo_id:
+                            continue
+                        # Also don't re-assert an old track ID onto this PDDL
+                        # object if that same track was just assigned to another
+                        # PDDL object by build_object_relations.
+                        if yolo_id in new_relations.values() and new_relations.get(pddl_id) != yolo_id:
+                            continue
                         # Check if position is consistent
                         old_pos = self.tracked_objects.get(yolo_id, {}).get('position')
                         new_pos = new_predicted_pos.get(yolo_id)
@@ -1277,6 +1685,10 @@ class Executor_Diffusion(Executor):
                         'position_history': [ee_pos],
                         'last_bbox': [bbox_2d[0], bbox_2d[1], 50, 50]
                     }
+
+                if not hasattr(self, 'last_known_semantic_positions'):
+                    self.last_known_semantic_positions = {}
+                self.last_known_semantic_positions[pddl_id] = np.asarray(ee_pos)
         
         return predicted_pos
 
@@ -1285,13 +1697,19 @@ class Executor_Diffusion(Executor):
         self.warnings = {"obj_to_pick": True, "place_to_drop": True}
         self.image_buffer = []
         self.detected_positions = {}
-        self.yolo_frequency = 15
         horizon = self.horizon if self.horizon is not None else 50
         self.debug_message("\tTask goal: ", symgoal)
 
+        # Perception snapshot is taken once after each gripper reset (see
+        # experiments_neurosymbolic.reset_gripper_and_perception) and reused
+        # until the next reset. If _skill_snapshot_pos is already set (shared
+        # via set_tracking_data), YOLO is not re-run.
+        if not hasattr(self, "_skill_snapshot_pos"):
+            self._skill_snapshot_pos = None
+
         step_executor = 0
         done = False
-        success = False 
+        success = False
         self.debug_message("\tStarting executor for step: ", self.id)
 
         while not done:
@@ -1307,38 +1725,53 @@ class Executor_Diffusion(Executor):
                         wrist_image = np.array(observation["robot0_eye_in_hand_image"].reshape((self.image_size, self.image_size, 3)), dtype=np.uint8)
                         ee_pos = observation["robot0_eef_pos"]
                         
-                        # STEP 1: Run YOLO detection (without grasp heuristics)
-                        if (step_executor % self.yolo_frequency == 0 and obs_num == 0) or self.save_data:
+                        # One simple color-mapped detection after gripper reset
+                        # (shared via perception_tracking); no multi-frame tracking.
+                        if self._skill_snapshot_pos is None and obs_num == 0:
+                            predicted_cubes_xyz, relations = self.detect_cubes_simple(
+                                agentview_image, wrist_image, ee_pos,
+                                conf_threshold=0.8,
+                                sim=getattr(env, "sim", None),
+                                render=render,
+                            )
+                            self.relations = relations
+                            self.map_id_semantic = {y: p for p, y in relations.items()}
+                            self._skill_snapshot_pos = copy.deepcopy(predicted_cubes_xyz)
+                            self.debug_message(
+                                f"  [OPERATOR SNAPSHOT] target={symgoal} "
+                                f"relations={self.relations} "
+                                f"pos_keys={list(predicted_cubes_xyz.keys())}"
+                            )
+                        elif self.save_data and obs_num == 0:
                             predicted_cubes_xyz = self.yolo_estimate(
-                                image1=agentview_image, 
-                                image2=wrist_image, 
-                                save_video=self.save_data, 
+                                image1=agentview_image,
+                                image2=wrist_image,
+                                save_video=True,
                                 cubes_obs={},
                                 ee_pos=ee_pos,
                                 conf_threshold=0.8,
                                 max_missing_frames=200,
-                                render=render
+                                render=render,
+                                sim=getattr(env, "sim", None)
                             )
+                            if predicted_cubes_xyz:
+                                self.update_relations_with_new_detections(predicted_cubes_xyz, objects_pos)
                         else:
-                            # Use tracked positions
-                            tracked_positions = {}
-                            for obj_id in self.tracked_objects.keys():
-                                tracked_positions[obj_id] = self.tracking_metadata[obj_id]['last_position']
-                            predicted_cubes_xyz = copy.deepcopy(tracked_positions)
-                        
-                        # STEP 2: Build/update relations mapping
-                        if predicted_cubes_xyz:
-                            self.update_relations_with_new_detections(predicted_cubes_xyz, objects_pos)
-                        
-                        # STEP 3: Correct positions of grasped objects (for both detected and undetected)
+                            predicted_cubes_xyz = copy.deepcopy(self._skill_snapshot_pos or {})
+                            # Keep the last snapshot bbox window visible while skills run.
+                            if render and getattr(self, "_last_yolo_viz", None) is not None:
+                                cv2.imshow("YOLO Detections", self._last_yolo_viz)
+                                cv2.waitKey(1)
+
+                        # Grasped objects move with the EE — snap their position
+                        # so Place still sees a consistent carried target.
                         predicted_cubes_xyz = self.correct_grasped_object_positions(
-                            predicted_cubes_xyz, 
-                            ee_pos, 
-                            image_shape=agentview_image.shape  # Pass image shape
+                            predicted_cubes_xyz,
+                            ee_pos,
+                            image_shape=agentview_image.shape
                         )
-                        
-                        # STEP 4: Build observation for policy
-                        obs = self.get_object_obs(env, objects_pos, predicted_cubes_xyz, 
+
+                        obs = self.get_object_obs(env, objects_pos, predicted_cubes_xyz,
                                                 symgoal[0], symgoal[1], relative_obs=self.oracle)
                     else:
                         objects_pos = observation["objects_pos"]
@@ -1374,11 +1807,11 @@ class Executor_Diffusion(Executor):
                         # Patch the current observation by copying the next one
                         processed_obs[i] = obs_next.copy()
                 
-                # If anomaly detected, get fresh observations with forced YOLO detection
+                # If anomaly detected, refresh sim observations but keep the
+                # frozen skill snapshot (do not re-run YOLO mid-skill).
                 if len(anomaly_indices) > 2:
-                    print(f"[RECOVERY] Getting {len(observations)} fresh observations with YOLO detection")
+                    print(f"[RECOVERY] Getting {len(observations)} fresh observations")
                     for _ in range(len(observations)):
-                        # Get current observation
                         obs = env._get_observations()
                         objects_pos = self.detector.get_all_objects_pos()
                         obs['objects_pos'] = objects_pos
@@ -1404,9 +1837,10 @@ class Executor_Diffusion(Executor):
             if len(actions[0][0]) < 4:
                 for index in self.nulified_action_indexes:
                     actions = np.insert(actions, index, 0, axis=2)
-            
+
             #observations = []
             i_act = 0
+            success = False
             for action in actions[0]:
                 action = self.map_gripper(action)
                 _, _, done, info = env.step(action)
@@ -1418,6 +1852,12 @@ class Executor_Diffusion(Executor):
                 # Append last obs and pop first obs to keep the buffer size
                 observations.append(obs)
                 observations.pop(0)
+                # Check termination every env step so we don't sail through
+                # a brief "over(gripper, obj)" window and then drift (peg3).
+                state = self.detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
+                if self.Beta(state, symgoal):
+                    success = True
+                    break
                 if i_act == n_act - 1:
                     break
                 i_act += 1
@@ -1425,8 +1865,9 @@ class Executor_Diffusion(Executor):
                 self.debug_message("Environment terminated")
             
             step_executor += 1
-            state = self.detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
-            success = self.Beta(state, symgoal)
+            if not success:
+                state = self.detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
+                success = self.Beta(state, symgoal)
             # print(state)
             # print(self.Beta(state, symgoal))
             # print(self.Beta({f'over(gripper,{symgoal[0]})': True}, symgoal))

@@ -8,10 +8,10 @@ yolo_model: models/yolo/hanoi_yolo.pt
 regressor_model: models/regressors/hanoi_regressor.pkl
 
 policies:
-  grasp: models/policies/extended_plus/grasp.ckpt
-  drop: models/policies/extended_plus/drop.ckpt
-  reach_pick: models/policies/extended_plus/reach_pick.ckpt
-  reach_place: models/policies/extended_plus/reach_pick.ckpt
+  grasp: diffusion_policy/data/train_gt/grasp/checkpoints/save/epoch=1300-train_loss=0.011.ckpt
+  drop: diffusion_policy/data/train_gt/drop/checkpoints/latest.ckpt
+  reach_pick: diffusion_policy/data/train_gt/reach_pick/checkpoints/epoch=2550-train_loss=0.010.ckpt
+  reach_place: diffusion_policy/data/train_gt/reach_place/checkpoints/latest.ckpt
 
 object_mapping:
   cube1: o1

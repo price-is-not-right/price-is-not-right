@@ -110,3 +110,9 @@ From the openpi directory:
 ```bash
 docker compose -f examples/robosuite/compose.yml up
 ```
+
+### Neuro-symbolic (diffusion policies + PDDL)
+
+For the full **collect → train regressor → train policies → execute** pipeline
+(including YOLO perception on Hanoi), see
+[`neuro_symbolic_method/README.md`](neuro_symbolic_method/README.md) §8.

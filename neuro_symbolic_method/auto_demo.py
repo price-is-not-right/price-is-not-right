@@ -89,7 +89,7 @@ regressor_model_paths = {
 }
 
 yolo_id_mappings = {
-    "Hanoi": {"green cube": "cube1", "red cube": "cube2", "blue cube": "cube3"},
+    "Hanoi": {"blue cube": "cube1", "red cube": "cube2", "green cube": "cube3"},
     "KitchenEnv": {"pot": "pot", "bread": "bread", "serving bowl": "serving", "stove": "stove", "button": "button"},
     "NutAssembly": {"roundnut": "roundnut", "squarenut": "squarenut", "roundpeg": "roundpeg", "squarepeg": "squarepeg"},
     "CubeSorting": {"green cube": "cube1", "red cube": "cube2", "blue cube": "cube3"},
@@ -234,6 +234,25 @@ class RecordDemos(gym.Wrapper):
         print("Task demonstrated: ", self.plan)
 
 
+    def _get_lift_drop_target(self, op_idx):
+        """
+        For a PICK operation at index ``op_idx``, return the destination of its
+        matching PLACE operation (the true drop target), so the post-grasp lift
+        can be recorded relative to it. Returns ``None`` for non-pick operations
+        or when no matching place is found.
+        """
+        op = self.plan[op_idx].lower().split(" ")
+        if not op or "pick" not in op[0]:
+            return None
+        # Plans alternate PICK <obj> <from> / PLACE <obj> <to>; the matching
+        # PLACE for this pick is the next operation acting on the same object.
+        picked_obj = op[1] if len(op) > 1 else None
+        for next_op in self.plan[op_idx + 1:]:
+            parts = next_op.lower().split(" ")
+            if "place" in parts[0] and len(parts) == 3 and parts[1] == picked_obj:
+                return parts[2]
+        return None
+
     def operator_to_function(self, operation):
         """
         A function that maps the operation to the corresponding function
@@ -291,6 +310,44 @@ class RecordDemos(gym.Wrapper):
             z = reg_z_dual.predict(features)[0]
         return x, y, z
 
+    def _camera_ray(self, cam_name, row_disp, col_disp, image_h, image_w):
+        """Reconstruct a world-frame ray through a pixel in the raw (unflipped) MuJoCo render frame."""
+        sim = self.env.sim
+        cam_id = sim.model.camera_name2id(cam_name)
+        cam_pos = sim.data.cam_xpos[cam_id].copy()
+        cam_rot = sim.data.cam_xmat[cam_id].reshape(3, 3).copy()
+        fovy = sim.model.cam_fovy[cam_id]
+        f = 0.5 * image_h / np.tan(fovy * np.pi / 360)
+        v = image_h - 1 - row_disp
+        u = col_disp
+        x_c = u - image_w / 2.0
+        y_c = -(v - image_h / 2.0)
+        z_c = -f
+        dir_cam = np.array([x_c, y_c, z_c], dtype=np.float64)
+        dir_cam /= np.linalg.norm(dir_cam)
+        return cam_pos, cam_rot @ dir_cam
+
+    def triangulate_dual(self, px1, py1, w1, h1, px2, py2, w2, h2, image_h=256, image_w=256):
+        """
+        Analytic stereo triangulation from agentview + wrist-camera bbox
+        centers, using the live sim's exact camera intrinsics/extrinsics.
+        Returns None if either detection is missing/degenerate.
+        """
+        if w1 <= 0 or h1 <= 0 or w2 <= 0 or h2 <= 0:
+            return None
+        row1 = image_h - 1 - py1
+        row2 = image_h - 1 - py2
+        o1, d1 = self._camera_ray("agentview", row1, px1, image_h, image_w)
+        o2, d2 = self._camera_ray("robot0_eye_in_hand", row2, px2, image_h, image_w)
+        A = np.stack([d1, -d2], axis=1)
+        ATA = A.T @ A
+        if np.linalg.det(ATA) < 1e-12:
+            return None
+        ts = np.linalg.solve(ATA, A.T @ (o2 - o1))
+        p1 = o1 + ts[0] * d1
+        p2 = o2 + ts[1] * d2
+        return (p1 + p2) / 2.0
+
     def yolo_estimate(self, obs_step):
         # Resize the image to fit YOLO input requirements
 
@@ -340,27 +397,29 @@ class RecordDemos(gym.Wrapper):
                 ee_pos = objects_info["gripper"]
 
                 found_match = False
-                for pred in wrist_results.boxes:
-                    cls_id2 = int(pred.cls)
+                for wrist_pred in wrist_results.boxes:
+                    cls_id2 = int(wrist_pred.cls)
                     cls2 = self.yolo_model.names[cls_id2]
                     if cls_id2 not in confidence_wrist:
-                        confidence_wrist[cls_id2] = pred.conf
+                        confidence_wrist[cls_id2] = wrist_pred.conf
                     else:
-                        if pred.conf > confidence_wrist[cls_id2]:
-                            confidence_wrist[cls_id2] = pred.conf
+                        if wrist_pred.conf > confidence_wrist[cls_id2]:
+                            confidence_wrist[cls_id2] = wrist_pred.conf
                         else:
                             continue
                     #print("2: ", cls2)
                     if cls_id2 == cls_id:
                             found_match = True
-                            x_cam2, y_cam2, w_cam2, h_cam2 = pred.xywhn.tolist()[0]
-                            conf_cam2 = pred.conf
+                            x_cam2, y_cam2, w_cam2, h_cam2 = wrist_pred.xywhn.tolist()[0]
+                            conf_cam2 = wrist_pred.conf
                             # Convert normalized coordinates to pixel coordinates
                             x_cam2 = int(x_cam2 * wrist_image.shape[1])
                             y_cam2 = int(y_cam2 * wrist_image.shape[0])
                             w_cam2 = int(w_cam2 * wrist_image.shape[1])
                             h_cam2 = int(h_cam2 * wrist_image.shape[0])
 
+                            tri = self.triangulate_dual(x, y, w, h, x_cam2, y_cam2, w_cam2, h_cam2,
+                                                         image_h=agentview.shape[0], image_w=agentview.shape[1])
                             self.bboxes_centers.append({
                                 "px_cam1": x,
                                 "py_cam1": y,
@@ -376,6 +435,9 @@ class RecordDemos(gym.Wrapper):
                                 "ee_x": ee_pos[0] if ee_pos is not None else None,
                                 "ee_y": ee_pos[1] if ee_pos is not None else None,
                                 "ee_z": ee_pos[2] if ee_pos is not None else None,
+                                "tri_x": tri[0] if tri is not None else None,
+                                "tri_y": tri[1] if tri is not None else None,
+                                "tri_z": tri[2] if tri is not None else None,
                                 "world_x": ground_truth_xyz[0],
                                 "world_y": ground_truth_xyz[1],
                                 "world_z": ground_truth_xyz[2],
@@ -397,6 +459,9 @@ class RecordDemos(gym.Wrapper):
                         "ee_x": ee_pos[0] if ee_pos is not None else None,
                         "ee_y": ee_pos[1] if ee_pos is not None else None,
                         "ee_z": ee_pos[2] if ee_pos is not None else None,
+                        "tri_x": None,
+                        "tri_y": None,
+                        "tri_z": None,
                         "world_x": ground_truth_xyz[0],
                         "world_y": ground_truth_xyz[1],
                         "world_z": ground_truth_xyz[2],
@@ -473,7 +538,14 @@ class RecordDemos(gym.Wrapper):
         Runs the trajectory
         """
         done = False
-        for operation in self.plan:
+        for op_idx, operation in enumerate(self.plan):
+            # Look ahead to the matching PLACE operator so the post-grasp lift
+            # (recorded under the reach_place action step) can reference the
+            # true drop target instead of the object being picked from. This
+            # keeps the reach_place observations consistent between the lift and
+            # the move-to-drop sub-phases, and matches what the executor feeds
+            # the ReachDrop policy at inference time (always the drop target).
+            self.lift_drop_target = self._get_lift_drop_target(op_idx)
             function, self.task, goal = self.operator_to_function(operation)
             print(f'Performing task: {self.task}, with goal: {goal}')
             done, obs = function(obs, goal)
@@ -816,20 +888,33 @@ class RecordDemos(gym.Wrapper):
         self.env.time_step = 0
 
         #print("Lifting object...")
-        while not state['picked_up({})'.format(goal_str)]:
-            action = np.asarray([0,0,0.4,0]) if not(self.randomize) else [0,0,0.5,0] + np.concatenate([np.random.normal(0, 0.1, 3), [0]])
-            action = 5*self.cap(action)
-            action = self.to_osc_pose(action)
-            next_obs, _, _, _, info  = self.env.step(action)
-            self.env.render() if self.render else None
-            next_state = self.detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
-            self.state_memory = self.record_step(obs, action, next_obs, self.state_memory, next_state, action_step="reach_place", goal=goal_str, info=info)
-            if self.state_memory is None:
-                return False, obs
-            obs, state = next_obs, next_state
-            reset_step_count += 1
-            if reset_step_count > 300:
-                return False, obs
+        # The lift is recorded under the reach_place action step, so its
+        # observations must reference the same target the ReachDrop policy sees
+        # at inference: the actual drop location. During a PICK the default
+        # self.place_to_drop is the object being picked *from* (directly below
+        # the gripper), which taught the policy to only lift when xy offset ~= 0
+        # and made it translate instead of lifting at execution. Point the
+        # place reference at the true drop target for the duration of the lift.
+        original_place_to_drop = self.place_to_drop
+        if getattr(self, "lift_drop_target", None) is not None:
+            self.place_to_drop = self.lift_drop_target
+        try:
+            while not state['picked_up({})'.format(goal_str)]:
+                action = np.asarray([0,0,0.4,0]) if not(self.randomize) else [0,0,0.5,0] + np.concatenate([np.random.normal(0, 0.1, 3), [0]])
+                action = 5*self.cap(action)
+                action = self.to_osc_pose(action)
+                next_obs, _, _, _, info  = self.env.step(action)
+                self.env.render() if self.render else None
+                next_state = self.detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
+                self.state_memory = self.record_step(obs, action, next_obs, self.state_memory, next_state, action_step="reach_place", goal=goal_str, info=info)
+                if self.state_memory is None:
+                    return False, obs
+                obs, state = next_obs, next_state
+                reset_step_count += 1
+                if reset_step_count > 300:
+                    return False, obs
+        finally:
+            self.place_to_drop = original_place_to_drop
         reset_step_count = 0
         self.env.time_step = 0
 

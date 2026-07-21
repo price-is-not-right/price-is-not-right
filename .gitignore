@@ -22,3 +22,15 @@ tests/monitor_logs_run_1
 dataset_making/inspection_scripts/inspection_videos/*
 planning/PDDL/hanoi/problem_save.pddl
 wandb/
+
+# Local datasets / build artifacts (neuro_symbolic_method)
+neuro_symbolic_method/data_*/
+neuro_symbolic_method/results/
+neuro_symbolic_method/Metric-FF-v2.1/
+neuro_symbolic_method/Metric-FF-v2.1.tgz
+neuro_symbolic_method/smoke_loc*.out
+neuro_symbolic_method/models/regressors/archive/
+neuro_symbolic_method/models/regressors/*.pkl.bak
+neuro_symbolic_method/models/policies/
+*:Zone.Identifier
+**/*:Zone.Identifier
