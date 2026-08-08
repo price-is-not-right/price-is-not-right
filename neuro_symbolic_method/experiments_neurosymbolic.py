@@ -3,6 +3,7 @@ warnings.filterwarnings("ignore")
 
 import os
 import argparse
+import copy
 import gym
 import joblib
 import yaml
@@ -331,16 +332,111 @@ def main():
 
         pick_place_success = 0
         n_ops = len(plan) / 2
-        skip_next_place = False
         perception_tracking = {}
+
+        def wipe_all_perception(preserve_last_known=False):
+            """Reset YOLO tracking on every skill executor."""
+            nonlocal perception_tracking
+            if not (args.use_yolo and actions):
+                perception_tracking = {}
+                return
+            actions[0].reset_tracking(preserve_last_known=preserve_last_known)
+            perception_tracking = copy.deepcopy(actions[0].get_tracking_data())
+            for ex in actions:
+                ex.set_tracking_data(copy.deepcopy(perception_tracking))
+
+        def refresh_yolo_poses(prefer_stereo=True, min_conf2=0.35, force_ids=None,
+                               skip_grasped=True):
+            """Re-detect visible cubes and update last_known from cameras.
+            Legitimate vision refresh — no GT.
+            - Stereo (conf2 >= min_conf2): always update.
+            - Mono / weak wrist: only fill missing cubes, never overwrite a prior.
+            - force_ids: always update these PDDL ids when detected (e.g. pick target
+              under the wrist after ReachPick).
+            - skip_grasped: do not write last_known for cubes currently in the gripper
+              (mid-air detections poison resting poses).
+            """
+            nonlocal perception_tracking, observations
+            if not (args.use_yolo and actions):
+                return
+            force_ids = set(force_ids or [])
+            grasped = set()
+            if skip_grasped:
+                try:
+                    g = detector.get_groundings(as_dict=True, binary_to_float=False,
+                                                return_distance=False)
+                    for pred, val in (g or {}).items():
+                        if val and pred.startswith("grasped("):
+                            grasped.add(pred[len("grasped("):-1])
+                except Exception:
+                    grasped = set()
+            obs = env._get_observations()
+            obs["objects_pos"] = detector.get_all_objects_pos()
+            if observations:
+                observations[-1] = obs
+            else:
+                observations = [obs]
+            ee = obs["robot0_eef_pos"]
+            img1 = np.array(obs["agentview_image"].reshape((args.size, args.size, 3)), dtype=np.uint8)
+            img2 = np.array(obs["robot0_eye_in_hand_image"].reshape((args.size, args.size, 3)), dtype=np.uint8)
+            ex0 = actions[0]
+            if not getattr(ex0, "yolo_model", None):
+                ex0.load_policy(detector=detector, yolo_model=yolo_model,
+                                regressor_model=regressor_model, image_size=args.size)
+            pred, rel = ex0.detect_cubes_simple(
+                img1, img2, ee, conf_threshold=0.75,
+                sim=getattr(env, "sim", None), render=False,
+            )
+            if rel:
+                ex0.relations = rel
+                ex0.map_id_semantic = {y: p for p, y in rel.items()}
+            if not hasattr(ex0, "last_known_semantic_positions"):
+                ex0.last_known_semantic_positions = {}
+            updated = []
+            for pddl_id, yolo_id in (rel or {}).items():
+                if yolo_id not in pred:
+                    continue
+                if skip_grasped and pddl_id in grasped and pddl_id not in force_ids:
+                    continue
+                conf2 = float(getattr(ex0, "_last_det_conf2", {}).get(yolo_id, 0.0))
+                new = np.asarray(pred[yolo_id], dtype=np.float64)
+                z = float(new[2])
+                if z < 0.80 or z > 0.93:
+                    continue
+                prev = ex0.last_known_semantic_positions.get(pddl_id)
+                forced = pddl_id in force_ids
+                stereo_ok = conf2 >= min_conf2
+                if prev is not None and not stereo_ok and not forced:
+                    # Keep a prior fix over a weak mono refresh.
+                    continue
+                if prev is None and not stereo_ok and not forced:
+                    # Gap-fill: require at least weak wrist evidence. Pure agentview
+                    # mono (conf2~0) often poisons the first ReachPick of an episode.
+                    if prefer_stereo or conf2 < 0.2:
+                        continue
+                ex0.last_known_semantic_positions[pddl_id] = new
+                updated.append(f"{pddl_id}:c2={conf2:.2f}")
+            perception_tracking = copy.deepcopy(ex0.get_tracking_data())
+            for ex in actions:
+                ex.set_tracking_data(copy.deepcopy(perception_tracking))
+            if updated:
+                print(f"[YOLO] pose refresh updated [{', '.join(updated)}]")
 
         def reset_gripper_and_perception():
             nonlocal perception_tracking
             reset_gripper(env, detector, args.render)
             if args.use_yolo and actions:
-                actions[0].reset_tracking()
-                perception_tracking = {}
-                print("[YOLO] tracking reset after gripper reset")
+                wipe_all_perception(preserve_last_known=True)
+                print("[YOLO] tracking reset after gripper reset "
+                      f"(kept last_known={list(actions[0].last_known_semantic_positions.keys())})")
+                # Home camera view: re-localize every visible cube (incl. ones
+                # shifted when a neighbor was lifted).
+                refresh_yolo_poses(prefer_stereo=False, min_conf2=0.35)
+
+        # Fresh episode: never carry poses from a previous episode's final layout.
+        wipe_all_perception(preserve_last_known=False)
+        if args.use_yolo:
+            print("[YOLO] episode tracking wipe (no last_known carry-over)")
 
         reset_gripper_and_perception()
 
@@ -358,10 +454,6 @@ def main():
                 sub_goal = (obj_to_pick, obj_to_drop)
                 print(f"Picking: {obj_to_pick}")
             elif op_name == "place":
-                if skip_next_place:
-                    skip_next_place = False
-                    print("Skipping PLACE after failed PICK")
-                    continue
                 if len(parts) < 3:
                     raise ValueError(f"Malformed PLACE operator: {operator}")
                 obj_to_pick = parts[1].lower()
@@ -385,15 +477,22 @@ def main():
             else:
                 raise ValueError(f"Unknown operator: {operator}")
 
-            for action_step in skill:
+            reach_failed = False
+            reach_ok = False
+            reach_drop_ok = False
+            skill_retries = 0
+            place_op_retries = 0
+            pick_op_retries = 0
+            while True:
+              for action_step in skill:
                 action_step.load_policy(
                     detector=detector,
                     yolo_model=yolo_model,
                     regressor_model=regressor_model,
                     image_size=args.size,
                 )
-                if perception_tracking:
-                    action_step.set_tracking_data(perception_tracking)
+                if args.use_yolo:
+                    action_step.set_tracking_data(copy.deepcopy(perception_tracking))
 
                 if args.debug:
                     print(f"\tExecuting action: {action_step.id}")
@@ -404,24 +503,244 @@ def main():
                 )
                 print(f"\t{action_step.id}: {'Success' if success else 'Failed'}")
                 if args.use_yolo:
-                    perception_tracking = action_step.get_tracking_data()
+                    perception_tracking = copy.deepcopy(action_step.get_tracking_data())
                 state = detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
 
+                # Retry failed ReachPick up to 2x with fresh snapshots.
+                while (args.use_yolo and not success and op_name == "pick"
+                       and action_step.id == "ReachPick" and skill_retries < 2):
+                    skill_retries += 1
+                    print(f"[YOLO] ReachPick failed; retry {skill_retries}/2 with fresh snapshot")
+                    if actions:
+                        for ex in actions:
+                            ex._skill_snapshot_pos = None
+                            ex._wrist_refine_done = False
+                            ex._resnapshot_next = False
+                        if sub_goal and sub_goal[0]:
+                            for ex in actions:
+                                lk = getattr(ex, "last_known_semantic_positions", None)
+                                if lk is not None:
+                                    lk.pop(sub_goal[0], None)
+                        refresh_yolo_poses(prefer_stereo=False, min_conf2=0.35)
+                    action_step.set_tracking_data(copy.deepcopy(perception_tracking))
+                    observations, success, goal_reached = action_step.execute(
+                        env, observations, args.n_act, sub_goal,
+                        goal_predicates.copy(), args.render,
+                    )
+                    print(f"\t{action_step.id} retry: {'Success' if success else 'Failed'}")
+                    if args.use_yolo:
+                        perception_tracking = copy.deepcopy(action_step.get_tracking_data())
+                    state = detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
+
+                # After ReachPick success, re-detect pick target under the wrist
+                # before Grasp — this is when stereo is most reliable.
+                if (args.use_yolo and success and op_name == "pick"
+                        and action_step.id == "ReachPick"):
+                    reach_ok = True
+                    force = [sub_goal[0]] if sub_goal and sub_goal[0] else []
+                    refresh_yolo_poses(
+                        prefer_stereo=False, min_conf2=0.35, force_ids=force)
+                    # Seed Pick's snapshot with the refreshed pick-target pose.
+                    if sub_goal and sub_goal[0] and actions:
+                        lk = actions[0].last_known_semantic_positions.get(sub_goal[0])
+                        yid = (actions[0].relations or {}).get(sub_goal[0])
+                        if lk is not None and yid is not None:
+                            snap = copy.deepcopy(
+                                perception_tracking.get("_skill_snapshot_pos") or {})
+                            snap[yid] = tuple(np.asarray(lk, dtype=np.float64).tolist())
+                            perception_tracking["_skill_snapshot_pos"] = snap
+                            for ex in actions:
+                                ex._skill_snapshot_pos = copy.deepcopy(snap)
+
+                # Retry failed ReachDrop once.
+                if (args.use_yolo and not success and op_name == "place"
+                        and action_step.id == "ReachDrop" and skill_retries < 1):
+                    skill_retries += 1
+                    print("[YOLO] ReachDrop failed; retrying once with fresh snapshot")
+                    if actions:
+                        for ex in actions:
+                            ex._skill_snapshot_pos = None
+                            ex._wrist_refine_done = False
+                            ex._resnapshot_next = False
+                        if sub_goal and sub_goal[1] and str(sub_goal[1]).startswith("cube"):
+                            for ex in actions:
+                                lk = getattr(ex, "last_known_semantic_positions", None)
+                                if lk is not None:
+                                    lk.pop(sub_goal[1], None)
+                        refresh_yolo_poses(prefer_stereo=False, min_conf2=0.35)
+                    action_step.set_tracking_data(copy.deepcopy(perception_tracking))
+                    observations, success, goal_reached = action_step.execute(
+                        env, observations, args.n_act, sub_goal,
+                        goal_predicates.copy(), args.render,
+                    )
+                    print(f"\t{action_step.id} retry: {'Success' if success else 'Failed'}")
+                    if args.use_yolo:
+                        perception_tracking = copy.deepcopy(action_step.get_tracking_data())
+                    state = detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
+
+                # Retry Pick once if reach succeeded but grasp failed.
+                if (args.use_yolo and not success and op_name == "pick"
+                        and action_step.id == "Pick" and reach_ok and skill_retries < 3):
+                    skill_retries += 1
+                    print("[YOLO] Pick failed after ReachPick; retrying grasp once")
+                    force = [sub_goal[0]] if sub_goal and sub_goal[0] else []
+                    refresh_yolo_poses(
+                        prefer_stereo=False, min_conf2=0.35, force_ids=force)
+                    if sub_goal and sub_goal[0] and actions:
+                        lk = actions[0].last_known_semantic_positions.get(sub_goal[0])
+                        yid = (actions[0].relations or {}).get(sub_goal[0])
+                        if lk is not None and yid is not None:
+                            snap = copy.deepcopy(
+                                perception_tracking.get("_skill_snapshot_pos") or {})
+                            snap[yid] = tuple(np.asarray(lk, dtype=np.float64).tolist())
+                            perception_tracking["_skill_snapshot_pos"] = snap
+                    action_step.set_tracking_data(copy.deepcopy(perception_tracking))
+                    # Keep Pick from wiping the seeded snapshot.
+                    action_step._skill_snapshot_pos = copy.deepcopy(
+                        perception_tracking.get("_skill_snapshot_pos"))
+                    observations, success, goal_reached = action_step.execute(
+                        env, observations, args.n_act, sub_goal,
+                        goal_predicates.copy(), args.render,
+                    )
+                    print(f"\t{action_step.id} retry: {'Success' if success else 'Failed'}")
+                    if args.use_yolo:
+                        perception_tracking = copy.deepcopy(action_step.get_tracking_data())
+                    state = detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
+
+                # After ReachDrop success onto a cube, refresh support pose for Drop.
+                if (args.use_yolo and success and op_name == "place"
+                        and action_step.id == "ReachDrop"):
+                    reach_drop_ok = True
+                    if sub_goal and sub_goal[1] and str(sub_goal[1]).startswith("cube"):
+                        refresh_yolo_poses(
+                            prefer_stereo=False, min_conf2=0.35,
+                            force_ids=[sub_goal[1]])
+                        lk = actions[0].last_known_semantic_positions.get(sub_goal[1])
+                        yid = (actions[0].relations or {}).get(sub_goal[1])
+                        if lk is not None and yid is not None:
+                            snap = copy.deepcopy(
+                                perception_tracking.get("_skill_snapshot_pos") or {})
+                            snap[yid] = tuple(np.asarray(lk, dtype=np.float64).tolist())
+                            perception_tracking["_skill_snapshot_pos"] = snap
+                            for ex in actions:
+                                ex._skill_snapshot_pos = copy.deepcopy(snap)
+
+                # Retry Drop once if reach succeeded but release failed.
+                if (args.use_yolo and not success and op_name == "place"
+                        and action_step.id == "Drop" and reach_drop_ok and skill_retries < 3):
+                    skill_retries += 1
+                    print("[YOLO] Drop failed after ReachDrop; retrying drop once")
+                    if sub_goal and sub_goal[1] and str(sub_goal[1]).startswith("cube"):
+                        refresh_yolo_poses(
+                            prefer_stereo=False, min_conf2=0.35,
+                            force_ids=[sub_goal[1]])
+                        lk = actions[0].last_known_semantic_positions.get(sub_goal[1])
+                        yid = (actions[0].relations or {}).get(sub_goal[1])
+                        if lk is not None and yid is not None:
+                            snap = copy.deepcopy(
+                                perception_tracking.get("_skill_snapshot_pos") or {})
+                            snap[yid] = tuple(np.asarray(lk, dtype=np.float64).tolist())
+                            perception_tracking["_skill_snapshot_pos"] = snap
+                    action_step.set_tracking_data(copy.deepcopy(perception_tracking))
+                    action_step._skill_snapshot_pos = copy.deepcopy(
+                        perception_tracking.get("_skill_snapshot_pos"))
+                    observations, success, goal_reached = action_step.execute(
+                        env, observations, args.n_act, sub_goal,
+                        goal_predicates.copy(), args.render,
+                    )
+                    print(f"\t{action_step.id} retry: {'Success' if success else 'Failed'}")
+                    if args.use_yolo:
+                        perception_tracking = copy.deepcopy(action_step.get_tracking_data())
+                    state = detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
+
+                if (args.use_yolo and not success and op_name == "pick"
+                        and action_step.id == "ReachPick"):
+                    reach_failed = True
+                    break
+                if (args.use_yolo and not success and op_name == "place"
+                        and action_step.id == "ReachDrop"):
+                    break
+              # Full place-operator retry: Drop sometimes needs a fresh ReachDrop
+              # approach after a near-miss release (peg or cube support).
+              if (args.use_yolo and op_name == "place" and not success
+                      and place_op_retries < 1 and not reach_failed):
+                  place_op_retries += 1
+                  skill_retries = 0
+                  reach_drop_ok = False
+                  print("[YOLO] Place operator failed; retrying ReachDrop+Drop once")
+                  if actions:
+                      for ex in actions:
+                          ex._skill_snapshot_pos = None
+                          ex._wrist_refine_done = False
+                          ex._resnapshot_next = False
+                      if sub_goal and sub_goal[1] and str(sub_goal[1]).startswith("cube"):
+                          refresh_yolo_poses(
+                              prefer_stereo=False, min_conf2=0.35,
+                              force_ids=[sub_goal[1]])
+                  continue
+              # Full pick-operator retry: ReachPick→Pick miss often needs a fresh
+              # approach with an updated wrist stereo fix, not just re-grasp.
+              if (args.use_yolo and op_name == "pick" and not success
+                      and pick_op_retries < 1 and not reach_failed):
+                  pick_op_retries += 1
+                  skill_retries = 0
+                  reach_ok = False
+                  print("[YOLO] Pick operator failed; retrying ReachPick+Pick once")
+                  if actions:
+                      for ex in actions:
+                          ex._skill_snapshot_pos = None
+                          ex._wrist_refine_done = False
+                          ex._wrist_refine_conf = 0.0
+                          ex._resnapshot_next = False
+                      if sub_goal and sub_goal[0]:
+                          for ex in actions:
+                              lk = getattr(ex, "last_known_semantic_positions", None)
+                              if lk is not None:
+                                  lk.pop(sub_goal[0], None)
+                          refresh_yolo_poses(
+                              prefer_stereo=False, min_conf2=0.35,
+                              force_ids=[sub_goal[0]])
+                  continue
+              # If ReachPick itself failed after its retries, allow one full
+              # pick-operator re-approach with wiped pick-target memory.
+              if (args.use_yolo and op_name == "pick" and reach_failed
+                      and pick_op_retries < 1):
+                  pick_op_retries += 1
+                  skill_retries = 0
+                  reach_failed = False
+                  reach_ok = False
+                  print("[YOLO] ReachPick exhausted; retrying full pick approach once")
+                  if actions:
+                      for ex in actions:
+                          ex._skill_snapshot_pos = None
+                          ex._wrist_refine_done = False
+                          ex._wrist_refine_conf = 0.0
+                          ex._resnapshot_next = False
+                      if sub_goal and sub_goal[0]:
+                          for ex in actions:
+                              lk = getattr(ex, "last_known_semantic_positions", None)
+                              if lk is not None:
+                                  lk.pop(sub_goal[0], None)
+                          refresh_yolo_poses(prefer_stereo=False, min_conf2=0.35)
+                  continue
+              break
+            if reach_failed:
+                success = False
             if op_name == "pick":
                 if not success:
                     print(f"--- Failed PICK. {pick_place_success}/{n_ops} ({pick_place_success/n_ops:.0%})")
-                    skip_next_place = True
-                    try:
-                        reset_gripper_and_perception()
-                    except ValueError:
-                        retry_reset = True
-                        break
+                    print("Aborting episode; moving to next.")
+                    break
+                elif args.use_yolo and actions:
+                    # Support may have shifted — refresh all visible cubes from cameras
+                    # instead of blindly deleting the support's last_known.
+                    refresh_yolo_poses(prefer_stereo=False, min_conf2=0.35)
             elif op_name == "place":
                 if success:
                     pick_place_success += 1
                     valid_pick_place_success += 1
                     print(f"+++ Picked and placed. {pick_place_success}/{n_ops} ({pick_place_success/n_ops:.0%})")
-                    if operator != plan[-1]:
+                    if j != len(plan) - 1:
                         try:
                             reset_gripper_and_perception()
                         except ValueError:
@@ -429,12 +748,8 @@ def main():
                             break
                 else:
                     print(f"--- Failed. {pick_place_success}/{n_ops} ({pick_place_success/n_ops:.0%})")
-                    try:
-                        reset_gripper_and_perception()
-                    except ValueError:
-                        retry_reset = True
-                        break
-
+                    print("Aborting episode; moving to next.")
+                    break
         n_ops = len(plan) / 2
         pick_place_successes.append(pick_place_success)
         percentage_advancement.append(pick_place_success / n_ops)

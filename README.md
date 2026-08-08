@@ -113,6 +113,17 @@ docker compose -f examples/robosuite/compose.yml up
 
 ### Neuro-symbolic (diffusion policies + PDDL)
 
-For the full **collect → train regressor → train policies → execute** pipeline
-(including YOLO perception on Hanoi), see
-[`neuro_symbolic_method/README.md`](neuro_symbolic_method/README.md) §8.
+For setup, Git LFS weights, GT vs YOLO eval, and the full
+**collect → train regressor → train policies → execute** pipeline on Hanoi, see
+[`neuro_symbolic_method/README.md`](neuro_symbolic_method/README.md).
+
+Quick vision smoke test (after `git lfs pull` and Metric-FF build):
+
+```bash
+cd neuro_symbolic_method
+conda activate neurosym
+unset LD_LIBRARY_PATH PYOPENGL_PLATFORM
+export MUJOCO_GL=osmesa
+export LD_PRELOAD="$CONDA_PREFIX/lib/libstdc++.so.6"
+python -u experiments_neurosymbolic.py --env Hanoi --use_yolo --n_ep 5 --seed 0
+```

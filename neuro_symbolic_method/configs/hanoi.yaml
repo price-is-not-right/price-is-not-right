@@ -27,27 +27,27 @@ executors:
     termination_condition: reach_pick
     nulified_action_indexes: [3]
     oracle: true
-    horizon_formula: "(8/n_act)*50"
+    horizon_formula: "(8/n_act)*60"
 
   - id: Pick
     policy_key: grasp
     termination_condition: pick
     nulified_action_indexes: [0, 1]
     oracle: true
-    horizon_formula: "(8/n_act)*30"
+    horizon_formula: "(8/n_act)*60"
 
   - id: ReachDrop
     policy_key: reach_place
     termination_condition: reach_drop
     nulified_action_indexes: [3]
     oracle: true
-    horizon_formula: "(8/n_act)*50"
+    horizon_formula: "(8/n_act)*55"
 
   - id: Drop
     policy_key: drop
     termination_condition: drop
     nulified_action_indexes: [0, 1]
     oracle: true
-    horizon_formula: "(8/n_act)*30"
+    horizon_formula: "(8/n_act)*60"
 
 goal_strategy: default   # use PDDL goal as-is

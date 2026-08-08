@@ -1,9 +1,9 @@
 # Neuro-Symbolic Method
 
 MuJoCo / Robosuite Hanoi with Metric-FF planning and diffusion policies.
-Vision at eval uses YOLO + pixel→3D regressor (`--use_yolo`).
+Vision at eval uses YOLO + pixel→3D regressors (`--use_yolo`).
 
-------------------------------------------------------------------------
+---
 
 # Setup
 
@@ -25,11 +25,22 @@ pip install gym joblib pyyaml h5py gymnasium matplotlib tarski dill torch \
   diffusers hydra-core wandb tqdm einops zarr pandas ultralytics scikit-learn
 ```
 
-Weights expected by `configs/hanoi.yaml`:
+Pull large weights with Git LFS (policies, YOLO, regressors):
 
-- `models/yolo/hanoi_yolo.pt`
-- `models/regressors/hanoi_regressor.pkl`
-- `models/policies/gt/{grasp,drop,reach_pick,reach_place}.ckpt`
+```bash
+# from repo root
+git lfs install
+git lfs pull
+```
+
+Weights expected for Hanoi vision eval (`configs/hanoi.yaml` + executor fallbacks):
+
+| Path | Role |
+|------|------|
+| `models/yolo/hanoi_yolo.pt` | Cube detector |
+| `models/regressors/hanoi_regressor.pkl` | Dual-camera pixel→world |
+| `models/regressors/hanoi_mono_regressor.pkl` | Agentview-only fallback when wrist misses |
+| `models/policies/gt/{grasp,drop,reach_pick,reach_place}.ckpt` | Diffusion skills |
 
 WSL2 / headless:
 
@@ -37,12 +48,52 @@ WSL2 / headless:
 # sim / eval
 unset LD_LIBRARY_PATH PYOPENGL_PLATFORM
 export MUJOCO_GL=osmesa
+# if libstdc++ conflicts under conda:
+export LD_PRELOAD="$CONDA_PREFIX/lib/libstdc++.so.6"
 
 # sklearn training
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 ```
 
-------------------------------------------------------------------------
+---
+
+# Quick test (GT + pretrained policies)
+
+After setup, verify planning + policies without vision. Needs Metric-FF built and
+`models/policies/gt/*.ckpt` (from clone / Git LFS).
+
+```bash
+conda activate neurosym
+cd neuro_symbolic_method
+unset LD_LIBRARY_PATH PYOPENGL_PLATFORM
+export MUJOCO_GL=osmesa
+
+# Oracle object poses (no --use_yolo)
+python -u experiments_neurosymbolic.py --env Hanoi --n_ep 5
+# optional viewer: add --render
+```
+
+---
+
+# Quick test (vision / YOLO)
+
+Cube poses come from YOLO + regressors (no cube GT injection). Peg poses use
+sim fixtures. PDDL planning and skill termination still use the sim detector
+predicates (`on` / `clear` / `grasped` / `over`).
+
+```bash
+conda activate neurosym
+cd neuro_symbolic_method
+unset LD_LIBRARY_PATH PYOPENGL_PLATFORM
+export MUJOCO_GL=osmesa
+export LD_PRELOAD="$CONDA_PREFIX/lib/libstdc++.so.6"
+
+python -u experiments_neurosymbolic.py --env Hanoi --use_yolo --n_ep 5 --seed 0
+# longer eval: --n_ep 50
+# optional: --render  |  --debug
+```
+
+---
 
 # Hanoi: collect → preprocess → train → execute (vision)
 
@@ -59,23 +110,24 @@ python -u auto_demo.py --env Hanoi --train_yolo --use_yolo --rnd_reset \
 
 Writes `data_reg/Hanoi_seed_42/reg/yolo_data/*.csv`.
 
-## 2. Train pixel→world regressor
+## 2. Train pixel→world regressors
 
 ```bash
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
+# Dual-camera regressor (active path in configs/hanoi.yaml)
 python -u train_regressor.py \
   --data_glob "data_reg/**/yolo_data/*.csv" \
   --active models/regressors/hanoi_regressor.pkl
-```
 
-Optional stereo residual:
-
-```bash
 python -u train_residual_regressor.py \
   --data_glob "data_reg/**/yolo_data/*.csv" \
   --out models/regressors/hanoi_residual_regressor.pkl
 ```
+
+The mono (agentview-only) fallback `hanoi_mono_regressor.pkl` is used when the
+wrist camera misses a cube; ship the pretrained file from this repo via LFS, or
+retrain a cam1-only regressor from the same CSVs.
 
 ## 3. Collect skill demos (vision obs)
 
@@ -106,12 +158,14 @@ Each skill needs a **task** yaml (dims + dataset) and a **train** yaml that defa
 
 Hanoi relative-obs dims (must match zarr / executor):
 
-| Skill | Task config | `obs_dim` | `action_dim` |
-|-------|-------------|-----------|--------------|
-| pick | `task/grasp_lowdim.yaml` | 2 | 2 |
-| place | `task/drop_lowdim.yaml` | 2 | 2 |
-| reach_pick | `task/reach_pick_lowdim.yaml` | 3 | 3 |
-| reach_place | `task/reach_place_lowdim.yaml` | 3 | 3 |
+
+| Skill       | Task config                    | `obs_dim` | `action_dim` |
+| ----------- | ------------------------------ | --------- | ------------ |
+| pick        | `task/grasp_lowdim.yaml`       | 2         | 2            |
+| place       | `task/drop_lowdim.yaml`        | 2         | 2            |
+| reach_pick  | `task/reach_pick_lowdim.yaml`  | 3         | 3            |
+| reach_place | `task/reach_place_lowdim.yaml` | 3         | 3            |
+
 
 Example task file (`task/grasp_lowdim.yaml`):
 
@@ -174,4 +228,4 @@ python -u experiments_neurosymbolic.py --env Hanoi --use_yolo --n_ep 5
 # oracle (no vision): omit --use_yolo
 ```
 
-------------------------------------------------------------------------
+---

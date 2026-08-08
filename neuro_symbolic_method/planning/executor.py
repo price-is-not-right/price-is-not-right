@@ -127,6 +127,40 @@ class Executor_Diffusion(Executor):
         self.debug_message("No residual regressor found; using raw triangulation.")
         return None
 
+    def _load_mono_regressor(self):
+        import os
+        candidates = [
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "models", "regressors", "hanoi_mono_regressor.pkl"),
+            "models/regressors/hanoi_mono_regressor.pkl",
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                try:
+                    payload = joblib.load(path)
+                    self.debug_message(f"Loaded mono regressor from {path}")
+                    return payload
+                except Exception as e:
+                    self.debug_message(f"Failed to load mono regressor from {path}: {e}")
+        return None
+
+    def _predict_mono_regressor(self, px1, py1, w1, h1, conf1, ee_x, ee_y, ee_z):
+        if not hasattr(self, "mono_regressor"):
+            self.mono_regressor = self._load_mono_regressor()
+        mono = self.mono_regressor
+        if mono is None:
+            return None
+        models = mono["models"] if isinstance(mono, dict) and "models" in mono and "reg_x" not in mono else mono
+        feats = np.array([[
+            float(px1), float(py1), float(w1), float(h1), float(conf1),
+            float(ee_x), float(ee_y), float(ee_z),
+        ]], dtype=np.float64)
+        return (
+            float(models["reg_x"].predict(feats)[0]),
+            float(models["reg_y"].predict(feats)[0]),
+            float(models["reg_z"].predict(feats)[0]),
+        )
+
     def _camera_ray(self, sim, cam_name, row_disp, col_disp, image_h, image_w):
         cam_id = sim.model.camera_name2id(cam_name)
         cam_pos = sim.data.cam_xpos[cam_id].copy()
@@ -232,6 +266,17 @@ class Executor_Diffusion(Executor):
                 if self._in_hanoi_workspace(est):
                     return float(est[0]), float(est[1]), float(est[2])
 
+        # Prefer dual-cam regressor over naive size-depth. Size-depth from a
+        # partial/occluded agentview box (common while holding another cube) can
+        # be off by >10cm and must stay a last resort.
+        # When wrist is missing, use the dedicated mono regressor (trained on
+        # cam1-only features) instead of zero-padding the dual model.
+        if not cam2_valid and cam1_valid:
+            mono_est = self._predict_mono_regressor(
+                px1, py1, w1, h1, conf1, ee_x, ee_y, ee_z)
+            if mono_est is not None and self._in_hanoi_workspace(mono_est):
+                return mono_est
+
         reg_est = None
         if self.regressor_model is not None:
             models_dual = self.regressor_model
@@ -262,12 +307,13 @@ class Executor_Diffusion(Executor):
             if half is not None:
                 aspect = max(float(w1), float(h1)) / max(min(float(w1), float(h1)), 1.0)
                 area = float(w1) * float(h1)
-                if aspect <= 1.25 and area >= 400.0:
+                # Tight gates: size-depth blows up on truncated/occluded boxes.
+                if aspect <= 1.20 and area >= 450.0:
                     p = self._single_view_size_depth(
                         sim, "agentview", px1, py1, w1, h1, half, image_h, image_w)
                     if p is not None:
-                        ok = (abs(float(p[0])) < 0.08 and -0.28 <= float(p[1]) <= 0.30
-                              and 0.80 <= float(p[2]) <= 0.92)
+                        ok = (abs(float(p[0])) < 0.06 and -0.26 <= float(p[1]) <= 0.28
+                              and 0.81 <= float(p[2]) <= 0.91)
                         self.debug_message(
                             f"  [SIZE-DEPTH] {cls_name} aspect={aspect:.2f} area={area:.0f} "
                             f"xyz={np.round(p, 4)} ok={ok} cam2={cam2_valid}"
@@ -336,6 +382,9 @@ class Executor_Diffusion(Executor):
             yolo_id = f"{cls}_0"
             predicted_pos[yolo_id] = xyz
             relations[pddl_id] = yolo_id
+            if not hasattr(self, "_last_det_conf2"):
+                self._last_det_conf2 = {}
+            self._last_det_conf2[yolo_id] = float(conf2)
             self.debug_message(
                 f"  [SIMPLE DET] {pddl_id} <- {yolo_id} "
                 f"xyz={np.round(xyz, 4)} conf1={conf1:.2f} conf2={conf2:.2f}"
@@ -1024,8 +1073,35 @@ class Executor_Diffusion(Executor):
         if yolo_id is None:
             yolo_id = self.relations.get(semantic_id)
 
+        pos = None
         if yolo_id is not None and yolo_id in predicted_pos:
-            pos = np.asarray(predicted_pos[yolo_id])
+            pos = np.asarray(predicted_pos[yolo_id], dtype=np.float64)
+            # Reject teleporting estimates for resting cubes (occlusion blowups).
+            # Stereo (wrist) detections may legitimately jump after a bad last_known
+            # (e.g. false-grasp EE latch) — allow those to correct memory.
+            if (semantic_id and str(semantic_id).startswith("cube")
+                    and hasattr(self, "last_known_semantic_positions")
+                    and semantic_id in self.last_known_semantic_positions):
+                last = np.asarray(self.last_known_semantic_positions[semantic_id], dtype=np.float64)
+                jump = float(np.linalg.norm(pos - last))
+                conf2 = float(getattr(self, "_last_det_conf2", {}).get(yolo_id, 0.0))
+                # Episode-scale / occlusion teleports: always trust the new detection.
+                if jump > 0.12:
+                    self.debug_message(
+                        f"  [POS GATE RESET] {semantic_id} jump={jump*1000:.0f}mm "
+                        f"accept new={np.round(pos, 4)} (discard last={np.round(last, 4)})"
+                    )
+                elif jump > 0.04 and conf2 < 0.4:
+                    self.debug_message(
+                        f"  [POS GATE] {semantic_id} jump={jump*1000:.0f}mm "
+                        f"keep={np.round(last, 4)} reject={np.round(pos, 4)}"
+                    )
+                    pos = last
+                elif jump > 0.04:
+                    self.debug_message(
+                        f"  [POS GATE OVERRIDE] {semantic_id} jump={jump*1000:.0f}mm "
+                        f"conf2={conf2:.2f} accept={np.round(pos, 4)}"
+                    )
         else:
             pos = self.get_last_known_position(semantic_id)
             if pos is not None and yolo_id is not None and yolo_id not in predicted_pos:
@@ -1041,18 +1117,27 @@ class Executor_Diffusion(Executor):
 
         return pos
 
-    def reset_tracking(self):
+    def reset_tracking(self, preserve_last_known=False):
+        kept = {}
+        if preserve_last_known and hasattr(self, "last_known_semantic_positions"):
+            # Keep resting-cube memory across gripper home; objects that did not
+            # move should not be re-localized from a weak single-view guess.
+            for k, v in (self.last_known_semantic_positions or {}).items():
+                if str(k).startswith("cube") and v is not None:
+                    kept[k] = np.asarray(v, dtype=np.float64).copy()
         self.tracked_objects = {}
         self.tracking_metadata = {}
         self.next_object_id = {}
         self.instances_per_label = {}
         self.detection_outlier_count = {}
-        self.last_known_semantic_positions = {}
+        self.last_known_semantic_positions = kept
         self.relations = {}
         self.map_id_semantic = {}
         self._skill_snapshot_pos = None
         self.count = 0
-        self.debug_message("Tracking data reset")
+        self.debug_message(
+            f"Tracking data reset (preserved_last_known={list(kept.keys())})"
+        )
     
     def set_tracking_data(self, tracking_data_dict):
         self.tracked_objects = tracking_data_dict.get('tracked_objects', {})
@@ -1289,7 +1374,7 @@ class Executor_Diffusion(Executor):
             self.relations = new_relations
             self.update_yolo_to_pddl_mapping()
 
-    def correct_grasped_object_positions(self, predicted_pos, ee_pos, image_shape):
+    def correct_grasped_object_positions(self, predicted_pos, ee_pos, image_shape, only_pddl_id=None):
         if not self.map_id_semantic:
             return predicted_pos
         
@@ -1297,6 +1382,11 @@ class Executor_Diffusion(Executor):
         self.debug_message(f"  -> Currently grasped objects (PDDL): {grasped_objects}")
         
         for yolo_id, pddl_id in self.map_id_semantic.items():
+            # Only latch EE onto the skill's pick target. Stacked supports often
+            # briefly report grasped() when the gripper closes on the top cube;
+            # writing EE into their last_known poisons later picks.
+            if only_pddl_id is not None and pddl_id != only_pddl_id:
+                continue
             if pddl_id in grasped_objects:
                 self.debug_message(f"  -> [GRASP CORRECTION] {yolo_id} (PDDL: {pddl_id}) is grasped")
                 
@@ -1360,8 +1450,38 @@ class Executor_Diffusion(Executor):
         horizon = self.horizon if self.horizon is not None else 50
         self.debug_message("\tTask goal: ", symgoal)
 
-        if not hasattr(self, "_skill_snapshot_pos"):
+        # Snapshot policy:
+        # - ReachPick / ReachDrop: always take a fresh detection (target may have moved).
+        # - Pick / Drop: reuse the reach snapshot — re-detecting under the gripper is
+        #   unreliable (occlusion / extreme close-up), and Z must stay stable for grasp.
+        if self.id in ("ReachPick", "ReachDrop"):
             self._skill_snapshot_pos = None
+            self._wrist_refine_done = False
+            self._wrist_refine_conf = 0.0
+            self._resnapshot_next = False
+        elif not hasattr(self, "_skill_snapshot_pos"):
+            self._skill_snapshot_pos = None
+        if not hasattr(self, "_wrist_refine_done"):
+            self._wrist_refine_done = False
+        if not hasattr(self, "_wrist_refine_conf"):
+            self._wrist_refine_conf = 0.0
+        if not hasattr(self, "_resnapshot_next"):
+            self._resnapshot_next = False
+
+        # Pick/Drop: if the reach snapshot is missing the skill target, seed from
+        # last_known (updated by a wrist-side refresh after ReachPick success).
+        if (self.use_yolo and self.id in ("Pick", "Drop") and symgoal
+                and getattr(self, "_skill_snapshot_pos", None) is not None):
+            tid = symgoal[0] if self.id == "Pick" else (
+                symgoal[1] if symgoal[1] and str(symgoal[1]).startswith("cube") else None)
+            if tid:
+                yid = (getattr(self, "relations", None) or {}).get(tid)
+                lk = getattr(self, "last_known_semantic_positions", {}).get(tid)
+                if yid is not None and lk is not None:
+                    z = float(np.asarray(lk)[2])
+                    if 0.80 <= z <= 0.93:
+                        self._skill_snapshot_pos[yid] = tuple(
+                            np.asarray(lk, dtype=np.float64).tolist())
 
         step_executor = 0
         done = False
@@ -1371,6 +1491,10 @@ class Executor_Diffusion(Executor):
         while not done:
             anomaly_safe = False
             max_shift_threshold = 0.1
+            # Re-detect at the start of a policy step when prior snapshot was mono-only.
+            if self.use_yolo and getattr(self, "_resnapshot_next", False):
+                self._skill_snapshot_pos = None
+                self._resnapshot_next = False
             while not anomaly_safe:
                 processed_obs = []
                 
@@ -1388,9 +1512,63 @@ class Executor_Diffusion(Executor):
                                 sim=getattr(env, "sim", None),
                                 render=render,
                             )
-                            self.relations = relations
-                            self.map_id_semantic = {y: p for p, y in relations.items()}
+                            if relations:
+                                self.relations = relations
+                                self.map_id_semantic = {y: p for p, y in relations.items()}
                             self._skill_snapshot_pos = copy.deepcopy(predicted_cubes_xyz)
+                            # Cache every detected cube so later place-on-cube can
+                            # fall back if a re-detect is occluded/noisy.
+                            if not hasattr(self, "last_known_semantic_positions"):
+                                self.last_known_semantic_positions = {}
+                            for pddl_id, yolo_id in (relations or self.relations or {}).items():
+                                if yolo_id not in predicted_cubes_xyz:
+                                    continue
+                                new = np.asarray(predicted_cubes_xyz[yolo_id], dtype=np.float64)
+                                conf2 = getattr(self, "_last_det_conf2", {}).get(yolo_id, 0.0)
+                                prev = self.last_known_semantic_positions.get(pddl_id)
+                                # Pick target and place support must use a fresh
+                                # detection — cached poses can be EE-height garbage
+                                # after grasp tracking. Other cubes may keep a prior
+                                # stereo fix over a weak single-view guess.
+                                is_pick_target = (symgoal and pddl_id == symgoal[0])
+                                is_place_support = (
+                                    symgoal and pddl_id == symgoal[1]
+                                    and str(pddl_id).startswith("cube")
+                                )
+                                # Drop impossible resting heights (EE latch residue).
+                                if prev is not None:
+                                    pz = float(np.asarray(prev)[2])
+                                    if pz < 0.80 or pz > 0.93:
+                                        self.debug_message(
+                                            f"  [LAST_KNOWN DROP] {pddl_id} z={pz:.3f} out of resting range"
+                                        )
+                                        prev = None
+                                        self.last_known_semantic_positions.pop(pddl_id, None)
+                                if (prev is not None and conf2 < 0.4
+                                        and not is_pick_target and not is_place_support):
+                                    if float(np.linalg.norm(new - np.asarray(prev))) > 0.025:
+                                        predicted_cubes_xyz[yolo_id] = tuple(np.asarray(prev).tolist())
+                                        self._skill_snapshot_pos[yolo_id] = predicted_cubes_xyz[yolo_id]
+                                        continue
+                                self.last_known_semantic_positions[pddl_id] = new
+                            # If the skill target is still mono-only, refresh on the
+                            # next policy step (keep this batch's snapshot intact —
+                            # n_obs>>1 would otherwise see empty poses).
+                            skill_tid = None
+                            if self.id == "ReachPick" and symgoal and symgoal[0]:
+                                skill_tid = symgoal[0]
+                            elif (self.id == "ReachDrop" and symgoal and symgoal[1]
+                                  and str(symgoal[1]).startswith("cube")):
+                                skill_tid = symgoal[1]
+                            skill_yolo = (relations or self.relations or {}).get(skill_tid) if skill_tid else None
+                            skill_c2 = getattr(self, "_last_det_conf2", {}).get(skill_yolo, 0.0) if skill_yolo else 0.0
+                            if (skill_tid is not None and skill_c2 < 0.35
+                                    and step_executor < 10 and not self._wrist_refine_done):
+                                self._resnapshot_next = True
+                                self.debug_message(
+                                    f"  [SNAPSHOT WAIT] {skill_tid} conf2={skill_c2:.2f}; "
+                                    f"will refresh next step"
+                                )
                             self.debug_message(
                                 f"  [OPERATOR SNAPSHOT] target={symgoal} "
                                 f"relations={self.relations} "
@@ -1412,6 +1590,80 @@ class Executor_Diffusion(Executor):
                                 self.update_relations_with_new_detections(predicted_cubes_xyz, objects_pos)
                         else:
                             predicted_cubes_xyz = copy.deepcopy(self._skill_snapshot_pos or {})
+                            # Mid-skill refine when wrist finally sees the skill target:
+                            # ReachPick → pick cube; ReachDrop → place-support cube.
+                            refine_id = None
+                            if self.id == "ReachPick" and symgoal and symgoal[0]:
+                                refine_id = symgoal[0]
+                            elif (self.id == "ReachDrop" and symgoal and symgoal[1]
+                                  and str(symgoal[1]).startswith("cube")):
+                                refine_id = symgoal[1]
+                            refine_every = 2
+                            allow_refine = (
+                                not self._wrist_refine_done
+                                or getattr(self, "_wrist_refine_conf", 0.0) < 0.7
+                            )
+                            if (self.use_yolo and allow_refine and obs_num == 0
+                                    and refine_id
+                                    and step_executor > 0 and step_executor % refine_every == 0):
+                                refined, rel = self.detect_cubes_simple(
+                                    agentview_image, wrist_image, ee_pos,
+                                    conf_threshold=0.7,
+                                    sim=getattr(env, "sim", None),
+                                    render=False,
+                                )
+                                yolo_id = (rel or self.relations).get(refine_id)
+                                conf2 = getattr(self, "_last_det_conf2", {}).get(yolo_id, 0.0)
+                                if yolo_id and yolo_id in refined and conf2 >= 0.3:
+                                    old = predicted_cubes_xyz.get(yolo_id)
+                                    new = np.asarray(refined[yolo_id], dtype=np.float64)
+                                    if old is not None:
+                                        old = np.asarray(old, dtype=np.float64)
+                                        delta = float(np.linalg.norm(new - old))
+                                        dz = float(abs(new[2] - old[2]))
+                                        # Prefer full stereo when wrist sees the target
+                                        # well. Only keep prior Z when the new stereo Z
+                                        # is a small disagreement (noise), not when prior
+                                        # Z is a stale single-view / last_known value.
+                                        max_delta = 0.10 if conf2 >= 0.5 else 0.06
+                                        if delta < max_delta and (dz < 0.025 or conf2 >= 0.6):
+                                            predicted_cubes_xyz[yolo_id] = tuple(new.tolist())
+                                            self._skill_snapshot_pos[yolo_id] = tuple(new.tolist())
+                                            self._wrist_refine_done = True
+                                            self._wrist_refine_conf = float(conf2)
+                                            self.debug_message(
+                                                f"  [WRIST REFINE] {refine_id} conf2={conf2:.2f} "
+                                                f"delta={delta*1000:.1f}mm -> {np.round(new, 4)}"
+                                            )
+                                        elif delta < max_delta:
+                                            blended = np.array(
+                                                [new[0], new[1], old[2]], dtype=np.float64)
+                                            predicted_cubes_xyz[yolo_id] = tuple(blended.tolist())
+                                            self._skill_snapshot_pos[yolo_id] = tuple(blended.tolist())
+                                            self._wrist_refine_done = True
+                                            self._wrist_refine_conf = float(conf2)
+                                            self.debug_message(
+                                                f"  [WRIST REFINE XY] {refine_id} conf2={conf2:.2f} "
+                                                f"dz={dz*1000:.1f}mm keep_z={old[2]:.4f} "
+                                                f"xy={np.round(blended[:2], 4)}"
+                                            )
+                                    # Refresh last-known for stereo-visible cubes (XY+gated Z).
+                                    if not hasattr(self, "last_known_semantic_positions"):
+                                        self.last_known_semantic_positions = {}
+                                    for pddl_id, yid in (rel or self.relations or {}).items():
+                                        c2 = getattr(self, "_last_det_conf2", {}).get(yid, 0.0)
+                                        if c2 < 0.4 or yid not in refined:
+                                            continue
+                                        cand = np.asarray(refined[yid], dtype=np.float64)
+                                        prev = self.last_known_semantic_positions.get(pddl_id)
+                                        if prev is not None and abs(cand[2] - float(prev[2])) > 0.015:
+                                            cand = np.array([cand[0], cand[1], float(prev[2])])
+                                        # Don't store EE-height garbage as resting pose.
+                                        if 0.80 <= float(cand[2]) <= 0.93:
+                                            self.last_known_semantic_positions[pddl_id] = cand
+                                        if self._skill_snapshot_pos is not None:
+                                            self._skill_snapshot_pos[yid] = tuple(cand.tolist())
+                                        predicted_cubes_xyz[yid] = tuple(cand.tolist())
                             if render and getattr(self, "_last_yolo_viz", None) is not None:
                                 cv2.imshow("YOLO Detections", self._last_yolo_viz)
                                 cv2.waitKey(1)
@@ -1419,7 +1671,8 @@ class Executor_Diffusion(Executor):
                         predicted_cubes_xyz = self.correct_grasped_object_positions(
                             predicted_cubes_xyz,
                             ee_pos,
-                            image_shape=agentview_image.shape
+                            image_shape=agentview_image.shape,
+                            only_pddl_id=symgoal[0] if symgoal else None,
                         )
 
                         obs = self.get_object_obs(env, objects_pos, predicted_cubes_xyz,
