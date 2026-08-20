@@ -1,0 +1,79 @@
+# Kinova3 Hanoi neuro-symbolic pipeline
+#
+# Robot: Kinova3 + Robotiq85Gripper (robosuite default for Kinova3)
+# Controller: OSC_POSITION (same as Panda eval / --ee demos)
+# PDDL / cubes / pegs: unchanged (planning/PDDL/hanoi/)
+#
+# Run all commands from neuro_symbolic_method/ with conda env neurosym.
+# See README.md in this folder for the full collect → train → eval sequence.
+
+env_name: Hanoi
+robot: Kinova3
+detector: HanoiDetector
+planning_mode: 0
+planning_predicates: ['on', 'clear', 'grasped']
+
+pddl_path: planning/PDDL/hanoi/
+
+# Cube detector can be shared with Panda (same colored cubes). Pose regressors
+# and diffusion policies MUST be trained on Kinova demos (wrist/extrinsics differ).
+yolo_model: models/yolo/hanoi_yolo.pt
+regressor_model: kinova/models/regressors/hanoi_regressor.pkl
+
+# EE home between place ops — retune after a GT smoke test if reset_gripper stalls.
+reset_gripper_pos: [-0.080193391, -0.03391656, 0.95828137]
+
+# Replan every step. The Robotiq grasp needs feedback before the policy commits
+# to closing; longer chunks overshoot in Z. Overridable with --n_act / --n_obs.
+n_act: 1
+n_obs: 16
+
+policies:
+  grasp: kinova/models/policies/gt/grasp.ckpt
+  drop: kinova/models/policies/gt/drop.ckpt
+  reach_pick: kinova/models/policies/gt/reach_pick.ckpt
+  reach_place: kinova/models/policies/gt/reach_place.ckpt
+
+object_mapping:
+  cube1: o1
+  cube2: o2
+  cube3: o3
+  peg1: o4
+  peg2: o5
+  peg3: o6
+
+# The reach policies emit 3 DoF, so the gripper dim is filled by the executor.
+# A commanded 0 does not hold a Robotiq85 closed against the cube's weight, so
+# reach skills state the gripper explicitly (-1 open, +1 closed).
+executors:
+  - id: ReachPick
+    policy_key: reach_pick
+    termination_condition: reach_pick
+    nulified_action_indexes: [3]
+    nulified_action_values: {3: -1.0}
+    oracle: true
+    horizon_formula: "60"
+
+  - id: Pick
+    policy_key: grasp
+    termination_condition: pick
+    nulified_action_indexes: [0, 1]
+    oracle: true
+    horizon_formula: "60"
+
+  - id: ReachDrop
+    policy_key: reach_place
+    termination_condition: reach_drop
+    nulified_action_indexes: [3]
+    nulified_action_values: {3: 1.0}
+    oracle: true
+    horizon_formula: "55"
+
+  - id: Drop
+    policy_key: drop
+    termination_condition: drop
+    nulified_action_indexes: [0, 1]
+    oracle: true
+    horizon_formula: "60"
+
+goal_strategy: default

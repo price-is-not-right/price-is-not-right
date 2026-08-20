@@ -32,10 +32,15 @@ FEATURE_COLS = [
     "px_cam2", "py_cam2", "w_cam2", "h_cam2", "conf_cam2",
     "ee_x", "ee_y", "ee_z",
 ]
+MONO_FEATURE_COLS = [
+    "px_cam1", "py_cam1", "w_cam1", "h_cam1", "conf_cam1",
+    "ee_x", "ee_y", "ee_z",
+]
 TARGET_COLS = ["world_x", "world_y", "world_z"]
 
 
-def load_data(patterns, max_rows=None, dedupe=True):
+def load_data(patterns, max_rows=None, dedupe=True, mono=False):
+    feature_cols = MONO_FEATURE_COLS if mono else FEATURE_COLS
     files = []
     for pattern in patterns:
         files.extend(glob.glob(pattern, recursive=True))
@@ -51,19 +56,21 @@ def load_data(patterns, max_rows=None, dedupe=True):
             print(f"  skip {f}: {e}")
     df = pd.concat(dfs, ignore_index=True)
     before = len(df)
-    df = df.dropna(subset=FEATURE_COLS + TARGET_COLS)
+    df = df.dropna(subset=feature_cols + TARGET_COLS)
     # Require agentview detection (cam1); wrist may be missing (zeros).
     df = df[(df["w_cam1"] > 0) & (df["h_cam1"] > 0)]
     if dedupe:
-        df = df.drop_duplicates(subset=FEATURE_COLS + TARGET_COLS)
+        df = df.drop_duplicates(subset=feature_cols + TARGET_COLS)
     if max_rows is not None and len(df) > max_rows:
         df = df.sample(n=max_rows, random_state=0)
     print(f"Loaded {before} rows -> {len(df)} usable (dedupe={dedupe})")
     return df
 
 
-def train(df, max_iter=400, max_depth=8, learning_rate=0.05, test_size=0.1, seed=0):
-    X = df[FEATURE_COLS].astype(np.float64).values
+def train(df, max_iter=400, max_depth=8, learning_rate=0.05, test_size=0.1, seed=0,
+          feature_cols=None):
+    feature_cols = feature_cols or FEATURE_COLS
+    X = df[feature_cols].astype(np.float64).values
     models = {}
     metrics = {}
     for axis, col in zip(["reg_x", "reg_y", "reg_z"], TARGET_COLS):
@@ -131,16 +138,20 @@ def main():
     parser.add_argument("--test_size", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max_rows", type=int, default=400000)
+    parser.add_argument("--mono", action="store_true",
+                        help="Train agentview-only regressor (8 features, no wrist cam).")
     args = parser.parse_args()
 
+    feature_cols = MONO_FEATURE_COLS if args.mono else FEATURE_COLS
     if args.out is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.out = f"models/regressors/archive/hanoi_regressor_{ts}.pkl"
+        prefix = "hanoi_mono_regressor" if args.mono else "hanoi_regressor"
+        args.out = f"models/regressors/archive/{prefix}_{ts}.pkl"
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     if os.path.exists(args.out) and not args.force:
         raise RuntimeError(f"Refusing to overwrite {args.out} (pass --force)")
 
-    df = load_data(args.data_glob, max_rows=args.max_rows)
+    df = load_data(args.data_glob, max_rows=args.max_rows, mono=args.mono)
     models, metrics = train(
         df,
         max_iter=args.max_iter,
@@ -148,9 +159,10 @@ def main():
         learning_rate=args.learning_rate,
         test_size=args.test_size,
         seed=args.seed,
+        feature_cols=feature_cols,
     )
     joblib.dump({"reg_x": models["reg_x"], "reg_y": models["reg_y"], "reg_z": models["reg_z"],
-                 "metrics": metrics, "feature_cols": FEATURE_COLS},
+                 "metrics": metrics, "feature_cols": feature_cols},
                 args.out)
     print(f"Saved versioned regressor to {args.out}")
 

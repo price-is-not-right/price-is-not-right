@@ -1,0 +1,12 @@
+# Large / generated Kinova artifacts (weights are tracked via Git LFS)
+data/
+data_gt/
+data_reg/
+data_smoke/
+models/regressors/archive/
+models/regressors/*.bak*
+models/yolo/*.pt
+# Only the deployed gt/ checkpoints are tracked (in LFS); this dir holds
+# leftovers from older training runs that nothing loads.
+models/policies/*.ckpt
+**/train/

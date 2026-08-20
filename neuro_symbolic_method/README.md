@@ -93,6 +93,9 @@ python -u experiments_neurosymbolic.py --env Hanoi --use_yolo --n_ep 5 --seed 0
 # optional: --render  |  --debug
 ```
 
+**Kinova3:** see [`kinova/README.md`](kinova/README.md) for the full
+collect → train regressor → train policies → eval pipeline (`--robot Kinova3`).
+
 ---
 
 # Hanoi: collect → preprocess → train → execute (vision)

@@ -31,8 +31,9 @@ class Executor_Diffusion(Executor):
                  policy, 
                  Beta, 
                  count=0,
-                 nulified_action_indexes=[], 
-                 oracle=False, 
+                 nulified_action_indexes=[],
+                 nulified_action_values=None,
+                 oracle=False,
                  horizon=None, 
                  use_yolo=False, 
                  save_data=False,
@@ -48,6 +49,11 @@ class Executor_Diffusion(Executor):
         self.policy = policy
         self.model = None
         self.nulified_action_indexes = nulified_action_indexes
+        # Value inserted for action dims the policy does not emit. Defaults to 0
+        # (hold); a Robotiq needs an explicit open/close to hold against load.
+        self.nulified_action_values = {
+            int(k): float(v) for k, v in (nulified_action_values or {}).items()
+        }
         self.horizon = horizon
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.oracle = oracle
@@ -111,9 +117,11 @@ class Executor_Diffusion(Executor):
 
     def _load_residual_regressor(self):
         import os
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         candidates = [
-            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                         "models", "regressors", "hanoi_residual_regressor.pkl"),
+            os.path.join(root, "kinova", "models", "regressors", "hanoi_residual_regressor.pkl"),
+            "kinova/models/regressors/hanoi_residual_regressor.pkl",
+            os.path.join(root, "models", "regressors", "hanoi_residual_regressor.pkl"),
             "models/regressors/hanoi_residual_regressor.pkl",
         ]
         for path in candidates:
@@ -129,9 +137,11 @@ class Executor_Diffusion(Executor):
 
     def _load_mono_regressor(self):
         import os
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         candidates = [
-            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                         "models", "regressors", "hanoi_mono_regressor.pkl"),
+            os.path.join(root, "kinova", "models", "regressors", "hanoi_mono_regressor.pkl"),
+            "kinova/models/regressors/hanoi_mono_regressor.pkl",
+            os.path.join(root, "models", "regressors", "hanoi_mono_regressor.pkl"),
             "models/regressors/hanoi_mono_regressor.pkl",
         ]
         for path in candidates:
@@ -179,7 +189,7 @@ class Executor_Diffusion(Executor):
         return cam_pos, dir_world
 
     @staticmethod
-    def _triangulate_rays(o1, d1, o2, d2, max_gap=0.04):
+    def _triangulate_rays(o1, d1, o2, d2, max_gap=0.08):
         A = np.stack([d1, -d2], axis=1)
         ATA = A.T @ A
         if np.linalg.det(ATA) < 1e-12:
@@ -226,6 +236,7 @@ class Executor_Diffusion(Executor):
 
     def pixel_to_world_dual(self, cls_id, px1, py1, w1, h1, conf1, px2, py2, w2, h2, conf2, ee_x, ee_y, ee_z,
                              sim=None, image_h=256, image_w=256, cls_name=None):
+        self._last_pose_source = "none"
         cam1_valid = w1 > 0 and h1 > 0
         cam2_valid = w2 > 0 and h2 > 0
 
@@ -236,45 +247,33 @@ class Executor_Diffusion(Executor):
             o2, d2 = self._camera_ray(sim, "robot0_eye_in_hand", row2, px2, image_h, image_w)
             est = self._triangulate_rays(o1, d1, o2, d2)
             if est is not None and self._in_hanoi_workspace(est):
+                raw = np.asarray(est, dtype=np.float64)
                 if not hasattr(self, "residual_regressor"):
                     self.residual_regressor = self._load_residual_regressor()
                 resid = self.residual_regressor
                 if resid is not None:
                     feats = np.array([[
-                        float(est[0]), float(est[1]), float(est[2]),
+                        float(raw[0]), float(raw[1]), float(raw[2]),
                         float(px1), float(py1), float(w1), float(h1), float(conf1),
                         float(px2), float(py2), float(w2), float(h2), float(conf2),
                         float(ee_x), float(ee_y), float(ee_z)]], dtype=np.float64)
                     m = resid["models"] if "models" in resid else resid
                     est = np.array([
-                        est[0] + m["res_x"].predict(feats)[0],
-                        est[1] + m["res_y"].predict(feats)[0],
-                        est[2] + m["res_z"].predict(feats)[0],
+                        raw[0] + m["res_x"].predict(feats)[0],
+                        raw[1] + m["res_y"].predict(feats)[0],
+                        raw[2] + m["res_z"].predict(feats)[0],
                     ], dtype=np.float64)
-                if cls_name is not None:
-                    half = self.CUBE_HALF_SIZE.get(cls_name)
-                    if half is not None:
-                        aspect = max(float(w1), float(h1)) / max(min(float(w1), float(h1)), 1.0)
-                        area = float(w1) * float(h1)
-                        if aspect <= 1.30 and area >= 400.0:
-                            p = self._single_view_size_depth(
-                                sim, "agentview", px1, py1, w1, h1, half, image_h, image_w)
-                            if (p is not None and self._in_hanoi_workspace(p)
-                                    and np.hypot(p[0] - est[0], p[1] - est[1]) < 0.03):
-                                est = np.array([est[0], est[1], 0.5 * (est[2] + float(p[2]))],
-                                               dtype=np.float64)
-                if self._in_hanoi_workspace(est):
-                    return float(est[0]), float(est[1]), float(est[2])
+                    if self._in_hanoi_workspace(est):
+                        self._last_pose_source = "stereo"
+                        return float(est[0]), float(est[1]), float(est[2])
+                self._last_pose_source = "stereo"
+                return float(raw[0]), float(raw[1]), float(raw[2])
 
-        # Prefer dual-cam regressor over naive size-depth. Size-depth from a
-        # partial/occluded agentview box (common while holding another cube) can
-        # be off by >10cm and must stay a last resort.
-        # When wrist is missing, use the dedicated mono regressor (trained on
-        # cam1-only features) instead of zero-padding the dual model.
         if not cam2_valid and cam1_valid:
             mono_est = self._predict_mono_regressor(
                 px1, py1, w1, h1, conf1, ee_x, ee_y, ee_z)
             if mono_est is not None and self._in_hanoi_workspace(mono_est):
+                self._last_pose_source = "mono"
                 return mono_est
 
         reg_est = None
@@ -300,6 +299,7 @@ class Executor_Diffusion(Executor):
                 float(reg_z_dual.predict(features)[0]),
             )
             if self._in_hanoi_workspace(reg_est):
+                self._last_pose_source = "dual"
                 return reg_est
 
         if sim is not None and cls_name is not None and cam1_valid:
@@ -313,17 +313,20 @@ class Executor_Diffusion(Executor):
                         sim, "agentview", px1, py1, w1, h1, half, image_h, image_w)
                     if p is not None:
                         ok = (abs(float(p[0])) < 0.06 and -0.26 <= float(p[1]) <= 0.28
-                              and 0.81 <= float(p[2]) <= 0.91)
+                              and 0.80 <= float(p[2]) <= 0.96)
                         self.debug_message(
                             f"  [SIZE-DEPTH] {cls_name} aspect={aspect:.2f} area={area:.0f} "
                             f"xyz={np.round(p, 4)} ok={ok} cam2={cam2_valid}"
                         )
                         if ok:
+                            self._last_pose_source = "size"
                             return float(p[0]), float(p[1]), float(p[2])
 
         if reg_est is not None:
+            self._last_pose_source = "dual"
             return reg_est
 
+        self._last_pose_source = "ee"
         return float(ee_x), float(ee_y), float(ee_z)
 
     def detect_cubes_simple(self, image1, image2, ee_pos, conf_threshold=0.8, sim=None, render=False):
@@ -385,6 +388,9 @@ class Executor_Diffusion(Executor):
             if not hasattr(self, "_last_det_conf2"):
                 self._last_det_conf2 = {}
             self._last_det_conf2[yolo_id] = float(conf2)
+            if not hasattr(self, "_last_det_source"):
+                self._last_det_source = {}
+            self._last_det_source[yolo_id] = getattr(self, "_last_pose_source", "none")
             self.debug_message(
                 f"  [SIMPLE DET] {pddl_id} <- {yolo_id} "
                 f"xyz={np.round(xyz, 4)} conf1={conf1:.2f} conf2={conf2:.2f}"
@@ -1212,9 +1218,13 @@ class Executor_Diffusion(Executor):
 
     def get_object_obs(self, env, objects_pos, predicted_pos, obj_to_pick, place_to_drop, relative_obs=False):
         gripper_pos = objects_pos["gripper"]
-        left_finger_pos = np.asarray(env.sim.data.body_xpos[env.sim.model.body_name2id("gripper0_leftfinger")])
-        right_finger_pos = np.asarray(env.sim.data.body_xpos[env.sim.model.body_name2id("gripper0_rightfinger")])
-        aperture = np.linalg.norm(left_finger_pos - right_finger_pos)
+        try:
+            from robot_utils import gripper_aperture
+            aperture = gripper_aperture(env.sim)
+        except Exception:
+            left_finger_pos = np.asarray(env.sim.data.body_xpos[env.sim.model.body_name2id("gripper0_leftfinger")])
+            right_finger_pos = np.asarray(env.sim.data.body_xpos[env.sim.model.body_name2id("gripper0_rightfinger")])
+            aperture = np.linalg.norm(left_finger_pos - right_finger_pos)
 
         obj_to_pick_yolo_id = self.relations.get(obj_to_pick, None)
         place_to_drop_yolo_id = self.relations.get(place_to_drop, None)
@@ -1442,7 +1452,6 @@ class Executor_Diffusion(Executor):
         
         return predicted_pos
 
-
     def execute(self, env, observations, n_act, symgoal, task_goals=None, render=False):
         self.warnings = {"obj_to_pick": True, "place_to_drop": True}
         self.image_buffer = []
@@ -1456,45 +1465,18 @@ class Executor_Diffusion(Executor):
         #   unreliable (occlusion / extreme close-up), and Z must stay stable for grasp.
         if self.id in ("ReachPick", "ReachDrop"):
             self._skill_snapshot_pos = None
-            self._wrist_refine_done = False
-            self._wrist_refine_conf = 0.0
-            self._resnapshot_next = False
         elif not hasattr(self, "_skill_snapshot_pos"):
             self._skill_snapshot_pos = None
-        if not hasattr(self, "_wrist_refine_done"):
-            self._wrist_refine_done = False
-        if not hasattr(self, "_wrist_refine_conf"):
-            self._wrist_refine_conf = 0.0
-        if not hasattr(self, "_resnapshot_next"):
-            self._resnapshot_next = False
-
-        # Pick/Drop: if the reach snapshot is missing the skill target, seed from
-        # last_known (updated by a wrist-side refresh after ReachPick success).
-        if (self.use_yolo and self.id in ("Pick", "Drop") and symgoal
-                and getattr(self, "_skill_snapshot_pos", None) is not None):
-            tid = symgoal[0] if self.id == "Pick" else (
-                symgoal[1] if symgoal[1] and str(symgoal[1]).startswith("cube") else None)
-            if tid:
-                yid = (getattr(self, "relations", None) or {}).get(tid)
-                lk = getattr(self, "last_known_semantic_positions", {}).get(tid)
-                if yid is not None and lk is not None:
-                    z = float(np.asarray(lk)[2])
-                    if 0.80 <= z <= 0.93:
-                        self._skill_snapshot_pos[yid] = tuple(
-                            np.asarray(lk, dtype=np.float64).tolist())
 
         step_executor = 0
         done = False
         success = False
         self.debug_message("\tStarting executor for step: ", self.id)
+        self._beta_hits = 0
 
         while not done:
             anomaly_safe = False
             max_shift_threshold = 0.1
-            # Re-detect at the start of a policy step when prior snapshot was mono-only.
-            if self.use_yolo and getattr(self, "_resnapshot_next", False):
-                self._skill_snapshot_pos = None
-                self._resnapshot_next = False
             while not anomaly_safe:
                 processed_obs = []
                 
@@ -1524,32 +1506,6 @@ class Executor_Diffusion(Executor):
                                 if yolo_id not in predicted_cubes_xyz:
                                     continue
                                 new = np.asarray(predicted_cubes_xyz[yolo_id], dtype=np.float64)
-                                conf2 = getattr(self, "_last_det_conf2", {}).get(yolo_id, 0.0)
-                                prev = self.last_known_semantic_positions.get(pddl_id)
-                                # Pick target and place support must use a fresh
-                                # detection — cached poses can be EE-height garbage
-                                # after grasp tracking. Other cubes may keep a prior
-                                # stereo fix over a weak single-view guess.
-                                is_pick_target = (symgoal and pddl_id == symgoal[0])
-                                is_place_support = (
-                                    symgoal and pddl_id == symgoal[1]
-                                    and str(pddl_id).startswith("cube")
-                                )
-                                # Drop impossible resting heights (EE latch residue).
-                                if prev is not None:
-                                    pz = float(np.asarray(prev)[2])
-                                    if pz < 0.80 or pz > 0.93:
-                                        self.debug_message(
-                                            f"  [LAST_KNOWN DROP] {pddl_id} z={pz:.3f} out of resting range"
-                                        )
-                                        prev = None
-                                        self.last_known_semantic_positions.pop(pddl_id, None)
-                                if (prev is not None and conf2 < 0.4
-                                        and not is_pick_target and not is_place_support):
-                                    if float(np.linalg.norm(new - np.asarray(prev))) > 0.025:
-                                        predicted_cubes_xyz[yolo_id] = tuple(np.asarray(prev).tolist())
-                                        self._skill_snapshot_pos[yolo_id] = predicted_cubes_xyz[yolo_id]
-                                        continue
                                 self.last_known_semantic_positions[pddl_id] = new
                             # If the skill target is still mono-only, refresh on the
                             # next policy step (keep this batch's snapshot intact —
@@ -1562,18 +1518,19 @@ class Executor_Diffusion(Executor):
                                 skill_tid = symgoal[1]
                             skill_yolo = (relations or self.relations or {}).get(skill_tid) if skill_tid else None
                             skill_c2 = getattr(self, "_last_det_conf2", {}).get(skill_yolo, 0.0) if skill_yolo else 0.0
-                            if (skill_tid is not None and skill_c2 < 0.35
-                                    and step_executor < 10 and not self._wrist_refine_done):
-                                self._resnapshot_next = True
-                                self.debug_message(
-                                    f"  [SNAPSHOT WAIT] {skill_tid} conf2={skill_c2:.2f}; "
-                                    f"will refresh next step"
-                                )
                             self.debug_message(
                                 f"  [OPERATOR SNAPSHOT] target={symgoal} "
                                 f"relations={self.relations} "
-                                f"pos_keys={list(predicted_cubes_xyz.keys())}"
+                                f"pos_keys={list(predicted_cubes_xyz.keys())} c2={skill_c2:.2f}"
                             )
+                            if self.use_yolo and symgoal:
+                                tid = symgoal[0]
+                                yid = (relations or self.relations or {}).get(tid)
+                                if yid and yid in predicted_cubes_xyz:
+                                    print(f"\t  [YOLO] snapshot {tid} {np.round(np.asarray(predicted_cubes_xyz[yid]), 4)} "
+                                          f"c2={getattr(self, '_last_det_conf2', {}).get(yid, 0):.2f} "
+                                          f"src={getattr(self, '_last_det_source', {}).get(yid, '?')}")
+
                         elif self.save_data and obs_num == 0:
                             predicted_cubes_xyz = self.yolo_estimate(
                                 image1=agentview_image,
@@ -1590,80 +1547,6 @@ class Executor_Diffusion(Executor):
                                 self.update_relations_with_new_detections(predicted_cubes_xyz, objects_pos)
                         else:
                             predicted_cubes_xyz = copy.deepcopy(self._skill_snapshot_pos or {})
-                            # Mid-skill refine when wrist finally sees the skill target:
-                            # ReachPick → pick cube; ReachDrop → place-support cube.
-                            refine_id = None
-                            if self.id == "ReachPick" and symgoal and symgoal[0]:
-                                refine_id = symgoal[0]
-                            elif (self.id == "ReachDrop" and symgoal and symgoal[1]
-                                  and str(symgoal[1]).startswith("cube")):
-                                refine_id = symgoal[1]
-                            refine_every = 2
-                            allow_refine = (
-                                not self._wrist_refine_done
-                                or getattr(self, "_wrist_refine_conf", 0.0) < 0.7
-                            )
-                            if (self.use_yolo and allow_refine and obs_num == 0
-                                    and refine_id
-                                    and step_executor > 0 and step_executor % refine_every == 0):
-                                refined, rel = self.detect_cubes_simple(
-                                    agentview_image, wrist_image, ee_pos,
-                                    conf_threshold=0.7,
-                                    sim=getattr(env, "sim", None),
-                                    render=False,
-                                )
-                                yolo_id = (rel or self.relations).get(refine_id)
-                                conf2 = getattr(self, "_last_det_conf2", {}).get(yolo_id, 0.0)
-                                if yolo_id and yolo_id in refined and conf2 >= 0.3:
-                                    old = predicted_cubes_xyz.get(yolo_id)
-                                    new = np.asarray(refined[yolo_id], dtype=np.float64)
-                                    if old is not None:
-                                        old = np.asarray(old, dtype=np.float64)
-                                        delta = float(np.linalg.norm(new - old))
-                                        dz = float(abs(new[2] - old[2]))
-                                        # Prefer full stereo when wrist sees the target
-                                        # well. Only keep prior Z when the new stereo Z
-                                        # is a small disagreement (noise), not when prior
-                                        # Z is a stale single-view / last_known value.
-                                        max_delta = 0.10 if conf2 >= 0.5 else 0.06
-                                        if delta < max_delta and (dz < 0.025 or conf2 >= 0.6):
-                                            predicted_cubes_xyz[yolo_id] = tuple(new.tolist())
-                                            self._skill_snapshot_pos[yolo_id] = tuple(new.tolist())
-                                            self._wrist_refine_done = True
-                                            self._wrist_refine_conf = float(conf2)
-                                            self.debug_message(
-                                                f"  [WRIST REFINE] {refine_id} conf2={conf2:.2f} "
-                                                f"delta={delta*1000:.1f}mm -> {np.round(new, 4)}"
-                                            )
-                                        elif delta < max_delta:
-                                            blended = np.array(
-                                                [new[0], new[1], old[2]], dtype=np.float64)
-                                            predicted_cubes_xyz[yolo_id] = tuple(blended.tolist())
-                                            self._skill_snapshot_pos[yolo_id] = tuple(blended.tolist())
-                                            self._wrist_refine_done = True
-                                            self._wrist_refine_conf = float(conf2)
-                                            self.debug_message(
-                                                f"  [WRIST REFINE XY] {refine_id} conf2={conf2:.2f} "
-                                                f"dz={dz*1000:.1f}mm keep_z={old[2]:.4f} "
-                                                f"xy={np.round(blended[:2], 4)}"
-                                            )
-                                    # Refresh last-known for stereo-visible cubes (XY+gated Z).
-                                    if not hasattr(self, "last_known_semantic_positions"):
-                                        self.last_known_semantic_positions = {}
-                                    for pddl_id, yid in (rel or self.relations or {}).items():
-                                        c2 = getattr(self, "_last_det_conf2", {}).get(yid, 0.0)
-                                        if c2 < 0.4 or yid not in refined:
-                                            continue
-                                        cand = np.asarray(refined[yid], dtype=np.float64)
-                                        prev = self.last_known_semantic_positions.get(pddl_id)
-                                        if prev is not None and abs(cand[2] - float(prev[2])) > 0.015:
-                                            cand = np.array([cand[0], cand[1], float(prev[2])])
-                                        # Don't store EE-height garbage as resting pose.
-                                        if 0.80 <= float(cand[2]) <= 0.93:
-                                            self.last_known_semantic_positions[pddl_id] = cand
-                                        if self._skill_snapshot_pos is not None:
-                                            self._skill_snapshot_pos[yid] = tuple(cand.tolist())
-                                        predicted_cubes_xyz[yid] = tuple(cand.tolist())
                             if render and getattr(self, "_last_yolo_viz", None) is not None:
                                 cv2.imshow("YOLO Detections", self._last_yolo_viz)
                                 cv2.waitKey(1)
@@ -1720,6 +1603,12 @@ class Executor_Diffusion(Executor):
                 else:
                     anomaly_safe = True
             processed_obs = np.array([processed_obs])
+            # Policies are trained with n_obs_steps (typically 4). The eval
+            # buffer may be longer; condition on the most recent To frames so
+            # the policy sees current state rather than stale history.
+            to = int(getattr(self.model, "n_obs_steps", processed_obs.shape[1]))
+            if processed_obs.shape[1] > to:
+                processed_obs = processed_obs[:, -to:]
             np_obs_dict = {'obs': processed_obs.astype(np.float32)}
             obs_dict = dict_apply(np_obs_dict, 
                 lambda x: torch.from_numpy(x).to(device=self.device))
@@ -1734,7 +1623,8 @@ class Executor_Diffusion(Executor):
             
             if len(actions[0][0]) < 4:
                 for index in self.nulified_action_indexes:
-                    actions = np.insert(actions, index, 0, axis=2)
+                    fill = self.nulified_action_values.get(index, 0.0)
+                    actions = np.insert(actions, index, fill, axis=2)
 
             i_act = 0
             success = False
@@ -1749,9 +1639,15 @@ class Executor_Diffusion(Executor):
                 observations.append(obs)
                 observations.pop(0)
                 state = self.detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
-                if self.Beta(state, symgoal):
-                    success = True
-                    break
+                beta_ok = bool(self.Beta(state, symgoal))
+                if beta_ok:
+                    self._beta_hits = getattr(self, "_beta_hits", 0) + 1
+                    settle = 3 if self.id in ("ReachPick", "ReachDrop") else 1
+                    if self._beta_hits >= settle:
+                        success = True
+                        break
+                else:
+                    self._beta_hits = 0
                 if i_act == n_act - 1:
                     break
                 i_act += 1
@@ -1761,7 +1657,7 @@ class Executor_Diffusion(Executor):
             step_executor += 1
             if not success:
                 state = self.detector.get_groundings(as_dict=True, binary_to_float=False, return_distance=False)
-                success = self.Beta(state, symgoal)
+                success = bool(self.Beta(state, symgoal))
 
             self.debug_message()
             self.debug_message("Checking goal predicates: ")

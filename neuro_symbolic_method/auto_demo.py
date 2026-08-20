@@ -183,7 +183,7 @@ class RecordDemos(gym.Wrapper):
         for predicate in copy_init_predicates.keys():
             if "ref" in predicate:
                 init_predicates.pop(predicate)
-        add_predicates_to_pddl(pddl_path, init_predicates)
+        add_predicates_to_pddl(self.pddl_path, init_predicates)
         if self.args.env == "CubeSorting":
             goal_predicates = []
             for predicate in state.keys():
@@ -229,7 +229,11 @@ class RecordDemos(gym.Wrapper):
             define_goal_in_pddl(self.pddl_path, goal_predicates)
 
         
-        self.plan, _ = call_planner(pddl_path, mode=planning_mode[self.args.env])
+        self.plan, _ = call_planner(self.pddl_path, mode=planning_mode[self.args.env])
+        if not self.plan:
+            # Planner returns False on failure / already-solved goals (common with
+            # --rnd_reset when the random tower already matches the PDDL goal peg).
+            self.plan = []
         if self.args.one_operation and len(self.plan) > 1:
             self.plan = self.plan[:2]
         print("Task demonstrated: ", self.plan)
@@ -476,7 +480,7 @@ class RecordDemos(gym.Wrapper):
                 print("Reset failed with exception: ", e)
                 self.success_reset = False
                 continue
-            if len(self.plan) == 0:
+            if not self.plan or len(self.plan) == 0:
                 print("Empty plan, resetting again...")
                 self.success_reset = False
             else:
@@ -584,9 +588,13 @@ class RecordDemos(gym.Wrapper):
             )
 
         gripper_pos = objects_pos["gripper"]
-        left_finger_pos = np.asarray(self.env.sim.data.body_xpos[self.env.sim.model.body_name2id("gripper0_leftfinger")])
-        right_finger_pos = np.asarray(self.env.sim.data.body_xpos[self.env.sim.model.body_name2id("gripper0_rightfinger")])
-        aperture = np.linalg.norm(left_finger_pos - right_finger_pos)
+        try:
+            from robot_utils import gripper_aperture
+            aperture = gripper_aperture(self.env.sim)
+        except Exception:
+            left_finger_pos = np.asarray(self.env.sim.data.body_xpos[self.env.sim.model.body_name2id("gripper0_leftfinger")])
+            right_finger_pos = np.asarray(self.env.sim.data.body_xpos[self.env.sim.model.body_name2id("gripper0_rightfinger")])
+            aperture = np.linalg.norm(left_finger_pos - right_finger_pos)
         
         try:
             obj_to_pick_pos = predicted_pos[self.obj_to_pick] if self.obj_to_pick in predicted_pos else objects_pos[self.obj_to_pick]
@@ -1183,6 +1191,12 @@ if __name__ == "__main__":
     parser.add_argument('--rnd_reset', action='store_true', help='Random reset for Hanoi env')
     parser.add_argument('--one_operation', action='store_true', help='Only one operation per episode')
     parser.add_argument('--action_split', action='store_true', help='For testing, directly splits the trajectories')
+    parser.add_argument('--robot', type=str, default='Panda', choices=['Panda', 'Kinova3'],
+                        help='Manipulator model (Kinova3 uses Robotiq85Gripper by default)')
+    parser.add_argument('--yolo_model', type=str, default=None,
+                        help='Override YOLO weights path (default: env registry / kinova paths)')
+    parser.add_argument('--regressor_model', type=str, default=None,
+                        help='Override dual regressor path for --use_yolo demos')
 
 
     args = parser.parse_args()
@@ -1195,6 +1209,7 @@ if __name__ == "__main__":
     args.env_dir = os.path.join(dir, experiment_name, experiment_id)
 
     print("Starting experiment {}.".format(os.path.join(experiment_name, experiment_id)))
+    print(f"Robot: {args.robot}")
 
     args.traces = args.env_dir + '/traces/'
     args.yolo_data = args.env_dir + '/yolo_data/'
@@ -1212,7 +1227,7 @@ if __name__ == "__main__":
     if args.env == 'Hanoi':
         env = suite.make(
             args.env,
-            robots="Panda",
+            robots=args.robot,
             controller_configs=controller_config,
             has_renderer=args.render,
             has_offscreen_renderer=True,
@@ -1229,7 +1244,7 @@ if __name__ == "__main__":
     else:
         env = suite.make(
             args.env,
-            robots="Panda",
+            robots=args.robot,
             controller_configs=controller_config,
             has_renderer=args.render,
             has_offscreen_renderer=True,
@@ -1247,9 +1262,11 @@ if __name__ == "__main__":
 
     detector = env_detectors[args.env](env)
     pddl_path = pddl_paths[args.env]
-    yolo_model = YOLO(yolo_model_paths[args.env]) if args.use_yolo or args.train_yolo else None
+    yolo_path = args.yolo_model or yolo_model_paths[args.env]
+    reg_path = args.regressor_model or regressor_model_paths[args.env]
+    yolo_model = YOLO(yolo_path) if args.use_yolo or args.train_yolo else None
     yolo_id_mapping = yolo_id_mappings[args.env] if args.use_yolo or args.train_yolo else None
-    regressor_model = joblib.load(regressor_model_paths[args.env]) if args.use_yolo or args.train_yolo else None
+    regressor_model = joblib.load(reg_path) if args.use_yolo or args.train_yolo else None
     env = GymWrapper(env, proprio_obs=True, flatten_obs=False)
     env = RecordDemos(env, 
                       detector, 

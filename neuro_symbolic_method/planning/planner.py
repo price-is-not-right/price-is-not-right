@@ -83,7 +83,11 @@ def call_planner(pddl_dir, problem="problem_dummy.pddl", structure="pddl", mode=
         output = subprocess.getoutput(run_script)
         #print("Output = ", output)
         if "unsolvable" in output or "goal can be simplified to FALSE" in output:
-            print("The planner failed because the problem is unsolvable: {}".format(output))
+            print("The planner failed because the problem is unsolvable.")
+            return False, False
+        # Already at goal / trivial → no actionable steps; callers re-sample.
+        if "goal can be simplified to TRUE" in output:
+            print("The planner returned no actionable plan (goal already holds).")
             return False, False
         try:
             output = output.split('ff: found legal plan as follows\n')[1]
@@ -92,6 +96,7 @@ def call_planner(pddl_dir, problem="problem_dummy.pddl", structure="pddl", mode=
             output = os.linesep.join([s for s in output.splitlines() if s])
         except Exception as e:
             print("The planner failed because of: {}.\nThe output of the planner was:\n{}".format(e, output))
+            return False, False
 
         plan, game_action_set = _output_to_plan(output, structure=structure)
         return plan, game_action_set

@@ -1,0 +1,60 @@
+# Kinova3 Hanoi — GT-trained policies, GT cube poses at eval (no --use_yolo).
+env_name: Hanoi
+robot: Kinova3
+detector: HanoiDetector
+planning_mode: 0
+planning_predicates: ['on', 'clear', 'grasped']
+
+pddl_path: planning/PDDL/hanoi/
+
+yolo_model: models/yolo/hanoi_yolo.pt
+regressor_model: kinova/models/regressors/hanoi_regressor.pkl
+
+reset_gripper_pos: [-0.080193391, -0.03391656, 0.95828137]
+
+policies:
+  grasp: kinova/models/policies/gt/grasp.ckpt
+  drop: kinova/models/policies/gt/drop.ckpt
+  reach_pick: kinova/models/policies/gt/reach_pick.ckpt
+  reach_place: kinova/models/policies/gt/reach_place.ckpt
+
+object_mapping:
+  cube1: o1
+  cube2: o2
+  cube3: o3
+  peg1: o4
+  peg2: o5
+  peg3: o6
+
+executors:
+  - id: ReachPick
+    policy_key: reach_pick
+    termination_condition: reach_pick
+    nulified_action_indexes: [3]
+    nulified_action_values: {3: -1.0}
+    oracle: true
+    horizon_formula: "60"
+
+  - id: Pick
+    policy_key: grasp
+    termination_condition: pick
+    nulified_action_indexes: [0, 1]
+    oracle: true
+    horizon_formula: "60"
+
+  - id: ReachDrop
+    policy_key: reach_place
+    termination_condition: reach_drop
+    nulified_action_indexes: [3]
+    nulified_action_values: {3: 1.0}
+    oracle: true
+    horizon_formula: "55"
+
+  - id: Drop
+    policy_key: drop
+    termination_condition: drop
+    nulified_action_indexes: [0, 1]
+    oracle: true
+    horizon_formula: "60"
+
+goal_strategy: default

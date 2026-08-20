@@ -1,0 +1,17 @@
+name: kinova_grasp_lowdim
+obs_dim: 2
+action_dim: 2
+keypoint_dim: 0
+
+env_runner:
+  _target_: diffusion_policy.env_runner.pick_place_env_runner.PickPlaceEnvRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.pick_place_dataset.PickPlaceLowdimDataset
+  zarr_path: ../kinova/data_gt/Hanoi_seed_0/hanoi_gt/hf_traj/pick/keypoint/keypoint.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: 98
