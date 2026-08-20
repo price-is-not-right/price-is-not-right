@@ -1082,16 +1082,15 @@ class Executor_Diffusion(Executor):
         pos = None
         if yolo_id is not None and yolo_id in predicted_pos:
             pos = np.asarray(predicted_pos[yolo_id], dtype=np.float64)
-            # Reject teleporting estimates for resting cubes (occlusion blowups).
-            # Stereo (wrist) detections may legitimately jump after a bad last_known
-            # (e.g. false-grasp EE latch) — allow those to correct memory.
+            # A resting cube cannot move, so a large jump is an occlusion
+            # artefact — unless it is large enough that the stored pose was the
+            # wrong one, in which case the new detection is the correction.
             if (semantic_id and str(semantic_id).startswith("cube")
                     and hasattr(self, "last_known_semantic_positions")
                     and semantic_id in self.last_known_semantic_positions):
                 last = np.asarray(self.last_known_semantic_positions[semantic_id], dtype=np.float64)
                 jump = float(np.linalg.norm(pos - last))
                 conf2 = float(getattr(self, "_last_det_conf2", {}).get(yolo_id, 0.0))
-                # Episode-scale / occlusion teleports: always trust the new detection.
                 if jump > 0.12:
                     self.debug_message(
                         f"  [POS GATE RESET] {semantic_id} jump={jump*1000:.0f}mm "

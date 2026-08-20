@@ -3,20 +3,26 @@
 # (no --use_yolo). Matches Panda diffusion settings: --n_act 8 --n_obs 16.
 #
 # Usage (from neuro_symbolic_method/):
-#   bash kinova/scripts/run_gt_eval.sh                 # 50 ep, seed 0
-#   bash kinova/scripts/run_gt_eval.sh 50 0
-#   bash kinova/scripts/run_gt_eval.sh 50 0 kinova/data/train/eval_gt.log
-#   CKPT_MODE=best bash kinova/scripts/run_gt_eval.sh  # lowest train_loss ckpt
+#   bash kinova/scripts/run_gt_eval.sh                 # 100 ep, seed 0
+#   bash kinova/scripts/run_gt_eval.sh 100 0
+#   bash kinova/scripts/run_gt_eval.sh 100 0 kinova/data/train/eval_gt.log
+#   SYNC=1 bash kinova/scripts/run_gt_eval.sh          # redeploy checkpoints first
+#   SYNC=1 CKPT_MODE=best bash kinova/scripts/run_gt_eval.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
+SYNC="${SYNC:-0}"
 CKPT_MODE="${CKPT_MODE:-latest}"
-N_EP="${1:-50}"
+N_EP="${1:-100}"
 SEED="${2:-0}"
 LOG="${3:-kinova/data/train/eval_kinova_gt_h16_seed${SEED}_n${N_EP}.log}"
 
-bash kinova/scripts/sync_gt_policy_checkpoints.sh "$CKPT_MODE"
+# Off by default: syncing overwrites the deployed checkpoints in
+# kinova/models/policies/gt/ with whatever the training runs hold now.
+if [[ "$SYNC" == "1" ]]; then
+  bash kinova/scripts/sync_gt_policy_checkpoints.sh "$CKPT_MODE"
+fi
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate neurosym

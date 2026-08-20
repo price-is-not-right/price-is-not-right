@@ -385,14 +385,13 @@ def main():
 
         def refresh_yolo_poses(prefer_stereo=True, min_conf2=0.35, force_ids=None,
                                skip_grasped=True):
-            """Re-detect visible cubes and update last_known from cameras.
-            Legitimate vision refresh — no GT.
+            """Re-detect visible cubes and update last_known from the cameras.
+
             - Stereo (conf2 >= min_conf2): always update.
             - Mono / weak wrist: only fill missing cubes, never overwrite a prior.
-            - force_ids: always update these PDDL ids when detected (e.g. pick target
-              under the wrist after ReachPick).
-            - skip_grasped: do not write last_known for cubes currently in the gripper
-              (mid-air detections poison resting poses).
+            - force_ids: always update these PDDL ids when detected.
+            - skip_grasped: skip cubes currently in the gripper, whose mid-air
+              position says nothing about where they will come to rest.
             """
             nonlocal perception_tracking, observations
             if not (args.use_yolo and actions):

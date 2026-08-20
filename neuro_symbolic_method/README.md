@@ -7,22 +7,31 @@ Vision at eval uses YOLO + pixel→3D regressors (`--use_yolo`).
 
 # Setup
 
+Install git-lfs *before* cloning, otherwise the weights arrive as small text
+pointers and loading them fails.
+
 ```bash
-conda create -n neurosym python=3.8 && conda activate neurosym
-sudo apt install bison flex   # for Metric-FF
+git lfs install
+git clone --recurse-submodules https://github.com/price-is-not-right/price-is-not-right.git
+cd price-is-not-right
 ```
 
 ```bash
-cd neuro_symbolic_method
+conda create -n neurosym python=3.10 -y && conda activate neurosym
+sudo apt install bison flex   # for Metric-FF
+```
+
+From the repository root:
+
+```bash
+pip install -r requirements.txt
+
+cd robosuite && git checkout teach && pip install -e . && cd ..
+cd robosuite-task-zoo && pip install -e . && cd ..
+cd neuro_symbolic_method/diffusion_policy && pip install -e . && cd ..
+
 wget https://fai.cs.uni-saarland.de/hoffmann/ff/Metric-FF-v2.1.tgz
 tar -xzvf Metric-FF-v2.1.tgz && cd Metric-FF-v2.1 && make && cd ..
-
-cd ../robosuite && git checkout teach && pip install -r requirements.txt && pip install -e .
-cd ../robosuite-task-zoo && pip install -e .
-cd ../neuro_symbolic_method/diffusion_policy && pip install -e . && cd ..
-
-pip install gym joblib pyyaml h5py gymnasium matplotlib tarski dill torch \
-  diffusers hydra-core wandb tqdm einops zarr pandas ultralytics scikit-learn
 ```
 
 Pull large weights with Git LFS (policies, YOLO, regressors):
@@ -39,6 +48,7 @@ Weights expected for Hanoi vision eval (`configs/hanoi.yaml` + executor fallback
 |------|------|
 | `models/yolo/hanoi_yolo.pt` | Cube detector |
 | `models/regressors/hanoi_regressor.pkl` | Dual-camera pixel→world |
+| `models/regressors/hanoi_residual_regressor.pkl` | Stereo residual correction |
 | `models/regressors/hanoi_mono_regressor.pkl` | Agentview-only fallback when wrist misses |
 | `models/policies/gt/{grasp,drop,reach_pick,reach_place}.ckpt` | Diffusion skills |
 
@@ -77,9 +87,9 @@ python -u experiments_neurosymbolic.py --env Hanoi --n_ep 5
 
 # Quick test (vision / YOLO)
 
-Cube poses come from YOLO + regressors (no cube GT injection). Peg poses use
-sim fixtures. PDDL planning and skill termination still use the sim detector
-predicates (`on` / `clear` / `grasped` / `over`).
+Cube poses come from YOLO + regressors. Peg poses use sim fixtures, and PDDL
+planning and skill termination use the sim detector predicates
+(`on` / `clear` / `grasped` / `over`).
 
 ```bash
 conda activate neurosym
@@ -123,6 +133,7 @@ python -u train_regressor.py \
   --data_glob "data_reg/**/yolo_data/*.csv" \
   --active models/regressors/hanoi_regressor.pkl
 
+# Stereo residual (optional; executor loads it if present)
 python -u train_residual_regressor.py \
   --data_glob "data_reg/**/yolo_data/*.csv" \
   --out models/regressors/hanoi_residual_regressor.pkl

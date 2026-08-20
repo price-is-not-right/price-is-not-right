@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Train all 4 Kinova GT diffusion policies from merged hanoi_gt zarr (100 demos).
+# Train all 4 Kinova diffusion policies from the hanoi_gt zarr.
+# max_train_episodes in the task yamls is an upper cap, so it adapts to the
+# number of demos you collected.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT/diffusion_policy"

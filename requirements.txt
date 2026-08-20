@@ -1,0 +1,44 @@
+# Python 3.10. Pinned to the versions the neurosym environment runs on.
+# The local packages (robosuite, robosuite-task-zoo, diffusion_policy) are
+# installed separately with `pip install -e` — see README.md.
+
+# Simulation
+mujoco==3.6.0
+mujoco-py==2.1.2.14
+gym==0.26.2
+gymnasium==0.29.1
+
+# Planning
+tarski==0.9.1
+
+# Perception
+ultralytics==8.4.21
+opencv-python==4.13.0.92
+scikit-learn==1.3.2
+joblib==1.5.3
+
+# Diffusion policies
+torch==2.10.0
+torchvision==0.25.0
+diffusers==0.17.1
+einops==0.8.2
+numba==0.64.0
+dill==0.4.0
+
+# Datasets and configuration
+zarr==2.18.3
+numcodecs==0.13.1
+h5py==3.16.0
+hydra-core==1.3.2
+omegaconf==2.3.0
+PyYAML==6.0.3
+
+# Numerics and utilities
+numpy==1.26.4
+scipy==1.15.2
+pandas==2.3.3
+threadpoolctl==3.6.0
+matplotlib==3.10.8
+imageio==2.37.3
+tqdm==4.67.3
+wandb==0.25.1

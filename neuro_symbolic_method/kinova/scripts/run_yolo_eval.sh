@@ -1,23 +1,29 @@
 #!/usr/bin/env bash
-# Sync latest trained policies, then run Kinova YOLO eval.
+# Run the Kinova YOLO eval on the deployed checkpoints.
 # Robot, policies, regressors and n_act all come from kinova/configs/hanoi.yaml,
 # selected by --robot Kinova3 alone.
 #
 # Usage (from neuro_symbolic_method/):
-#   bash kinova/scripts/run_yolo_eval.sh              # 50 ep, seed 0
-#   bash kinova/scripts/run_yolo_eval.sh 50 0         # explicit n_ep seed
-#   bash kinova/scripts/run_yolo_eval.sh 50 0 kinova/data/train/eval_run.log
-#   CKPT_MODE=best bash kinova/scripts/run_yolo_eval.sh  # use lowest train_loss ckpt
+#   bash kinova/scripts/run_yolo_eval.sh              # 100 ep, seed 0
+#   bash kinova/scripts/run_yolo_eval.sh 100 0        # explicit n_ep seed
+#   bash kinova/scripts/run_yolo_eval.sh 100 0 kinova/data/train/eval_run.log
+#   SYNC=1 bash kinova/scripts/run_yolo_eval.sh       # redeploy from training runs first
+#   SYNC=1 CKPT_MODE=best bash kinova/scripts/run_yolo_eval.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
+SYNC="${SYNC:-0}"
 CKPT_MODE="${CKPT_MODE:-latest}"
-N_EP="${1:-50}"
+N_EP="${1:-100}"
 SEED="${2:-0}"
 LOG="${3:-kinova/data/train/eval_yolo_seed${SEED}_n${N_EP}.log}"
 
-bash kinova/scripts/sync_policy_checkpoints.sh "$CKPT_MODE"
+# Off by default: syncing overwrites the deployed checkpoints in
+# kinova/models/policies/gt/ with whatever the training runs hold now.
+if [[ "$SYNC" == "1" ]]; then
+  bash kinova/scripts/sync_gt_policy_checkpoints.sh "$CKPT_MODE"
+fi
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate neurosym

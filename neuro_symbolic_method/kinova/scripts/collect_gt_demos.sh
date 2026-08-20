@@ -5,7 +5,7 @@
 #
 # Usage (from neuro_symbolic_method/):
 #   bash kinova/scripts/collect_gt_demos.sh
-#   EPISODES=100 SEED=0 bash kinova/scripts/collect_gt_demos.sh
+#   EPISODES=30 SEED=0 bash kinova/scripts/collect_gt_demos.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -17,7 +17,7 @@ unset LD_LIBRARY_PATH PYOPENGL_PLATFORM || true
 export MUJOCO_GL=osmesa
 export LD_PRELOAD="${CONDA_PREFIX}/lib/libstdc++.so.6"
 
-EPISODES="${EPISODES:-100}"
+EPISODES="${EPISODES:-30}"
 SEED="${SEED:-0}"
 RUN_NAME="${RUN_NAME:-hanoi_gt}"
 DIR="${DIR:-./kinova/data_gt/}"
